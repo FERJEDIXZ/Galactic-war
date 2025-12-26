@@ -1,0 +1,1199 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.UI;
+using System.Collections;
+using Mirror;
+
+public class PlayerShoot : NetworkBehaviour
+{
+    [Header("Referencias")]
+    public PlayerShip playerShip;
+    public AmmoUI ammoUI;
+    public TargetSelector targetSelector;
+
+    [Header("HUD")]
+    public Button botonDisparoHUD;
+
+    [Header("Misiles")]
+    public PlayerMissileShoot missileShoot;
+
+    [Header("Misiles automáticos")]
+    [Tooltip("Cada cuántos segundos intenta lanzar un misil mientras el auto-fire está activo.")]
+    public float segundosEntreMisilesAuto = 2f;
+    private float tiempoUltimoMisilAuto = 0f;
+
+    [Header("Disparo")]
+    [Tooltip("Se llenará automáticamente desde PlayerShip (NaveData.firePoints).")]
+    public Transform[] firePoints;
+    public float laserSpeed = 320f;
+    public float fireDelayBetweenGroups = 1f;
+    public float alcanceMaximo = 600f;
+
+    [Header("Sistema de Daño")]
+    [Tooltip("Intervalo entre cada aplicación de daño (en segundos)")]
+    public float damageTickRate = 1f;
+
+    [Header("Precisión / variación de daño")]
+    [Range(1f, 100f)]
+    [Tooltip("Probabilidad de que un tick de daño falle (1 = 1%, 100 = 100%)")]
+    public float probabilidadFallo = 10f;
+    [Tooltip("Porcentaje +/- de variación sobre el daño final.")]
+    public float variacionDanoPorcentaje = 5f;
+
+    private float tiempoUltimoDisparo = 0f;
+    private float nextDamageTick = 0f;
+
+    private Coroutine disparoAutoCoroutine = null;
+
+    bool apuntandoAlObjetivo = false;
+    Transform objetivoBloqueado = null;
+
+    void Awake()
+    {
+        if (playerShip == null)
+            playerShip = GetComponent<PlayerShip>();
+
+        if (ammoUI == null)
+            ammoUI = FindObjectOfType<AmmoUI>();
+
+        if (ammoUI == null)
+        {
+            GameObject goAmmo = GameObject.Find("AmmoUI");
+            if (goAmmo != null)
+                ammoUI = goAmmo.GetComponent<AmmoUI>();
+        }
+
+        if (targetSelector == null)
+            targetSelector = FindObjectOfType<TargetSelector>();
+
+        if (targetSelector == null)
+        {
+            GameObject goTarget = GameObject.Find("TargetSelector");
+            if (goTarget != null)
+                targetSelector = goTarget.GetComponent<TargetSelector>();
+        }
+
+        if (botonDisparoHUD == null)
+        {
+            GameObject goBtn = GameObject.Find("AttackButton");
+            if (goBtn != null)
+                botonDisparoHUD = goBtn.GetComponent<Button>();
+        }
+
+        if (missileShoot == null)
+            missileShoot = GetComponent<PlayerMissileShoot>();
+    }
+
+    void Start()
+    {
+        if (playerShip == null || !playerShip.isLocalPlayer)
+            return;
+
+        // Solo sincronizar FirePoints para el jugador local
+        // Esperar un poco para asegurar que la nave visual está instanciada
+        Invoke(nameof(SincronizarFirePoints), 0.3f);
+
+        if (botonDisparoHUD != null)
+        {
+            botonDisparoHUD.onClick.RemoveAllListeners();
+            botonDisparoHUD.onClick.AddListener(() =>
+            {
+                if (!apuntandoAlObjetivo)
+                {
+                    IniciarDisparoAutomatico();
+                }
+                else
+                {
+                    DetenerDisparoAutomatico();
+                }
+            });
+        }
+    }
+
+    void OnDestroy()
+    {
+        // Limpieza al destruir
+    }
+
+    void Update()
+    {
+        if (playerShip == null || !playerShip.isLocalPlayer)
+            return;
+
+        // ✅ Para todos los dispositivos (móvil y PC), la lógica es la misma
+        // ApuntarAObjetivoActual() ahora SOLO modifica targetRotation de PlayerShip
+        // y FixedUpdate de PlayerShip aplicará la rotación
+        
+        if (Keyboard.current == null)
+        {
+            // Dispositivos móviles: aplicar rotación y daño
+            if (apuntandoAlObjetivo)
+            {
+                ApuntarAObjetivoActual();
+                AplicarDañoContinuo();
+            }
+            return;
+        }
+
+        // PC: manejar input de teclado
+        bool ctrlPressed =
+            (Keyboard.current.leftCtrlKey != null && Keyboard.current.leftCtrlKey.isPressed) ||
+            (Keyboard.current.rightCtrlKey != null && Keyboard.current.rightCtrlKey.isPressed);
+
+        bool ctrlPressedThisFrame =
+            (Keyboard.current.leftCtrlKey != null && Keyboard.current.leftCtrlKey.wasPressedThisFrame) ||
+            (Keyboard.current.rightCtrlKey != null && Keyboard.current.rightCtrlKey.wasPressedThisFrame);
+
+        if (ctrlPressedThisFrame)
+        {
+            if (!apuntandoAlObjetivo)
+            {
+                IniciarDisparoAutomatico();
+            }
+            else
+            {
+                DetenerDisparoAutomatico();
+            }
+        }
+
+        if (Mouse.current != null)
+        {
+            bool attackClicked = Mouse.current.leftButton.wasPressedThisFrame;
+
+            if (ctrlPressed && attackClicked)
+            {
+                if (!apuntandoAlObjetivo)
+                {
+                    IniciarDisparoAutomatico();
+                }
+                else
+                {
+                    DetenerDisparoAutomatico();
+                }
+            }
+        }
+
+        // PC: aplicar rotación y daño
+        if (apuntandoAlObjetivo)
+        {
+            ApuntarAObjetivoActual();
+            AplicarDañoContinuo();
+        }
+    }
+
+    void AplicarDañoContinuo()
+    {
+        if (!apuntandoAlObjetivo || objetivoBloqueado == null)
+            return;
+
+        float distance = Vector3.Distance(transform.position, objetivoBloqueado.position);
+        if (distance > alcanceMaximo)
+        {
+            Debug.LogWarning($"[PlayerShoot] Objetivo fuera de alcance: {distance:F1} > {alcanceMaximo}");
+            return;
+        }
+
+        if (Time.time >= nextDamageTick)
+        {
+            int weaponDamage = playerShip != null ? playerShip.GetBonusDaño() : 0;
+            
+            if (weaponDamage <= 0)
+            {
+                Debug.LogWarning("[PlayerShoot] No hay armas equipadas o daño es 0");
+                return;
+            }
+            
+            AmmoData ammoActual = (ammoUI != null) ? ammoUI.GetAmmoActual() : null;
+            float multiplicadorAmmo = (ammoActual != null) ? ammoActual.multiplicador : 1f;
+            bool robaEscudo = (ammoActual != null) && ammoActual.robaEscudo;
+            
+            float damageThisTick = weaponDamage * multiplicadorAmmo * damageTickRate;
+            
+            float factorVar = 1f + Random.Range(-variacionDanoPorcentaje, variacionDanoPorcentaje) / 100f;
+            damageThisTick *= factorVar;
+            
+            bool fallo = Random.Range(1f, 100f) <= probabilidadFallo;
+            if (fallo)
+            {
+                damageThisTick = 0f;
+                Debug.Log($"[PlayerShoot] ¡Disparo falló! (Probabilidad: {probabilidadFallo}%)");
+                
+                if (objetivoBloqueado != null)
+                {
+                    uint targetNetId = 0;
+                    NetworkIdentity targetNI = objetivoBloqueado.GetComponent<NetworkIdentity>();
+                    if (targetNI != null)
+                    {
+                        targetNetId = targetNI.netId;
+                    }
+                    
+                    CmdShowMiss(objetivoBloqueado.position, targetNetId);
+                }
+            }
+            
+            int finalDamage = Mathf.Max(0, Mathf.RoundToInt(damageThisTick));
+
+            if (robaEscudo)
+            {
+                Debug.Log($"[PlayerShoot] Intentando robar {finalDamage} de escudo (Armas: {weaponDamage}, Mult: {multiplicadorAmmo}x)");
+                RobarEscudoDelObjetivo(objetivoBloqueado, finalDamage);
+            }
+            else
+            {
+                Debug.Log($"[PlayerShoot] Aplicando {finalDamage} de daño (Armas: {weaponDamage}, Mult: {multiplicadorAmmo}x, Dist: {distance:F1})");
+                AplicarDañoAObjetivo(objetivoBloqueado, finalDamage);
+            }
+
+            nextDamageTick = Time.time + damageTickRate;
+        }
+    }
+
+    void AplicarDañoAObjetivo(Transform target, int damage)
+    {
+        if (target == null || damage <= 0)
+        {
+            Debug.LogWarning($"[PlayerShoot] No se puede aplicar daño: Target={target != null}, Damage={damage}");
+            return;
+        }
+
+        PlayerShip targetShip = target.GetComponent<PlayerShip>();
+        if (targetShip != null)
+        {
+            Debug.Log($"[PlayerShoot] Enviando {damage} de daño a PlayerShip (NetID: {targetShip.netId})");
+            CmdDealDamageToPlayer(targetShip.netId, damage);
+            return;
+        }
+
+        Alien targetAlien = target.GetComponent<Alien>();
+        if (targetAlien != null)
+        {
+            Debug.Log($"[PlayerShoot] Enviando {damage} de daño a Alien (NetID: {targetAlien.netId})");
+            CmdDealDamageToAlien(targetAlien.netId, damage);
+            return;
+        }
+
+        Debug.LogWarning($"[PlayerShoot] El objetivo '{target.name}' no tiene componente PlayerShip ni Alien");
+    }
+
+    void RobarEscudoDelObjetivo(Transform target, int cantidadARobar)
+    {
+        if (target == null || cantidadARobar <= 0)
+        {
+            Debug.LogWarning($"[PlayerShoot] No se puede robar escudo: Target={target != null}, Cantidad={cantidadARobar}");
+            return;
+        }
+
+        PlayerShip targetShip = target.GetComponent<PlayerShip>();
+        if (targetShip != null)
+        {
+            Debug.Log($"[PlayerShoot] Robando {cantidadARobar} de escudo a PlayerShip (NetID: {targetShip.netId})");
+            CmdStealShieldFromPlayer(targetShip.netId, cantidadARobar);
+            return;
+        }
+
+        Alien targetAlien = target.GetComponent<Alien>();
+        if (targetAlien != null)
+        {
+            Debug.Log($"[PlayerShoot] Robando {cantidadARobar} de escudo a Alien (NetID: {targetAlien.netId})");
+            CmdStealShieldFromAlien(targetAlien.netId, cantidadARobar);
+            return;
+        }
+
+        Debug.LogWarning($"[PlayerShoot] El objetivo '{target.name}' no tiene componente PlayerShip ni Alien");
+    }
+
+    [Command]
+    void CmdDealDamageToPlayer(uint targetNetId, int damage)
+    {
+        Debug.Log($"[PlayerShoot SERVER] Recibido comando de daño a Player: NetID={targetNetId}, Damage={damage}");
+        
+        if (NetworkServer.spawned.TryGetValue(targetNetId, out NetworkIdentity targetIdentity))
+        {
+            PlayerShip targetShip = targetIdentity.GetComponent<PlayerShip>();
+            if (targetShip != null)
+            {
+                Debug.Log($"[PlayerShip SERVER] Aplicando {damage} de daño a {targetShip.name}");
+                targetShip.RecibirDaño(damage);
+            }
+            else
+            {
+                Debug.LogError($"[PlayerShoot SERVER] NetID {targetNetId} no tiene componente PlayerShip");
+            }
+        }
+        else
+        {
+            Debug.LogError($"[PlayerShoot SERVER] No se encontró objeto con NetID {targetNetId}");
+        }
+    }
+
+    [Command]
+    void CmdDealDamageToAlien(uint targetNetId, int damage)
+    {
+        Debug.Log($"[PlayerShoot SERVER] Recibido comando de daño a Alien: NetID={targetNetId}, Damage={damage}");
+        
+        if (NetworkServer.spawned.TryGetValue(targetNetId, out NetworkIdentity targetIdentity))
+        {
+            Alien targetAlien = targetIdentity.GetComponent<Alien>();
+            if (targetAlien != null)
+            {
+                Debug.Log($"[PlayerShoot SERVER] Aplicando {damage} de daño a {targetAlien.name}");
+                // ✅ CAMBIO: Pasar el netId del atacante (este jugador)
+                targetAlien.RecibirDaño(damage, netIdentity.netId);
+            }
+            else
+            {
+                Debug.LogError($"[PlayerShoot SERVER] NetID {targetNetId} no tiene componente Alien");
+            }
+        }
+        else
+        {
+            Debug.LogError($"[PlayerShoot SERVER] No se encontró objeto con NetID {targetNetId}");
+        }
+    }
+
+    [Command]
+    void CmdShowMiss(Vector3 position, uint targetNetId)
+    {
+        Debug.Log($"[PlayerShoot SERVER] Mostrando fallo en pos={position}, targetNetId={targetNetId}");
+        
+        if (DamageTextManager.Instance != null)
+        {
+            DamageTextManager.Instance.ShowMiss(position, targetNetId);
+        }
+    }
+
+    [Command]
+    void CmdStealShieldFromPlayer(uint targetNetId, int cantidadARobar)
+    {
+        Debug.Log($"[PlayerShoot SERVER] Recibido comando de robo de escudo a Player: NetID={targetNetId}, Cantidad={cantidadARobar}");
+        
+        if (NetworkServer.spawned.TryGetValue(targetNetId, out NetworkIdentity targetIdentity))
+        {
+            PlayerShip targetShip = targetIdentity.GetComponent<PlayerShip>();
+            if (targetShip != null)
+            {
+                int escudoRobado = targetShip.RobarEscudo(cantidadARobar);
+                
+                if (escudoRobado > 0)
+                {
+                    Debug.Log($"[PlayerShoot SERVER] Robado {escudoRobado} de escudo de {targetShip.name}");
+                    
+                    if (playerShip != null)
+                    {
+                        playerShip.AgregarEscudoRobado(escudoRobado);
+                        Debug.Log($"[PlayerShoot SERVER] Escudo transferido al atacante");
+                    }
+                }
+                else
+                {
+                    Debug.Log($"[PlayerShoot SERVER] El objetivo no tenía escudo para robar");
+                }
+            }
+            else
+            {
+                Debug.LogError($"[PlayerShoot SERVER] NetID {targetNetId} no tiene componente PlayerShip");
+            }
+        }
+        else
+        {
+            Debug.LogError($"[PlayerShoot SERVER] No se encontró objeto con NetID {targetNetId}");
+        }
+    }
+
+    [Command]
+    void CmdStealShieldFromAlien(uint targetNetId, int cantidadARobar)
+    {
+        Debug.Log($"[PlayerShoot SERVER] Recibido comando de robo de escudo a Alien: NetID={targetNetId}, Cantidad={cantidadARobar}");
+        
+        if (NetworkServer.spawned.TryGetValue(targetNetId, out NetworkIdentity targetIdentity))
+        {
+            Alien targetAlien = targetIdentity.GetComponent<Alien>();
+            if (targetAlien != null)
+            {
+                int escudoActualAlien = targetAlien.GetEscudoActual();
+                
+                if (escudoActualAlien > 0)
+                {
+                    int escudoRobado = Mathf.Min(escudoActualAlien, cantidadARobar);
+                    
+                    // ✅ CAMBIO: Pasar el netId del atacante (este jugador)
+                    targetAlien.RecibirDañoSoloEscudo(escudoRobado, netIdentity.netId);
+                    
+                    Debug.Log($"[PlayerShoot SERVER] Robado {escudoRobado} de escudo de {targetAlien.name}");
+                    
+                    if (playerShip != null)
+                    {
+                        playerShip.AgregarEscudoRobado(escudoRobado);
+                        Debug.Log($"[PlayerShoot SERVER] Escudo transferido al atacante");
+                    }
+                }
+                else
+                {
+                    Debug.Log($"[PlayerShoot SERVER] El alien no tenía escudo para robar");
+                }
+            }
+            else
+            {
+                Debug.LogError($"[PlayerShoot SERVER] NetID {targetNetId} no tiene componente Alien");
+            }
+        }
+        else
+        {
+            Debug.LogError($"[PlayerShoot SERVER] No se encontró objeto con NetID {targetNetId}");
+        }
+    }
+
+    public void BotonDisparo()
+    {
+        if (playerShip == null || !playerShip.isLocalPlayer)
+            return;
+
+        DetenerDisparoAutomatico();
+        IntentarDisparar(false);
+    }
+
+    public void BotonDisparoTarget()
+    {
+        if (playerShip == null || !playerShip.isLocalPlayer)
+            return;
+
+        if (!apuntandoAlObjetivo)
+        {
+            IniciarDisparoAutomatico();
+        }
+        else
+        {
+            DetenerDisparoAutomatico();
+        }
+    }
+
+    void IniciarDisparoAutomatico()
+    {
+        if (playerShip == null || !playerShip.isLocalPlayer)
+        {
+            Debug.LogWarning("[PlayerShoot] No se puede iniciar disparo: playerShip inválido");
+            return;
+        }
+
+        // Si ya estábamos disparando al mismo objetivo, solo continuar
+        Transform nuevoObjetivo = (targetSelector != null) ? targetSelector.GetObjetivoActual() : null;
+        
+        if (nuevoObjetivo == null)
+        {
+            Debug.Log("[PlayerShoot] No hay objetivo para disparo automático.");
+            return;
+        }
+
+        // Si cambió el objetivo, actualizar
+        if (objetivoBloqueado != nuevoObjetivo)
+        {
+            Debug.Log($"[PlayerShoot] Cambiando objetivo: {objetivoBloqueado?.name} → {nuevoObjetivo.name}");
+            objetivoBloqueado = nuevoObjetivo;
+            
+            // Sincronizar el nuevo objetivo con todos los clientes
+            playerShip.SetAttackTarget(objetivoBloqueado);
+        }
+
+        Debug.Log($"[PlayerShoot] ✓ Iniciando disparo automático hacia {objetivoBloqueado.name}");
+        
+        apuntandoAlObjetivo = true;
+        
+        // 🔄 SINCRONIZAR EN RED: Notificar a todos los clientes que se inició el ataque
+        if (isLocalPlayer)
+        {
+            CmdSincronizarIniciarAtaque();
+        }
+
+        if (disparoAutoCoroutine != null)
+        {
+            StopCoroutine(disparoAutoCoroutine);
+            disparoAutoCoroutine = null;
+        }
+
+        disparoAutoCoroutine = StartCoroutine(BucleDisparoAutomatico());
+    }
+    
+    [Command]
+    void CmdSincronizarIniciarAtaque()
+    {
+        // Sincronizar en el servidor
+        if (playerShip != null)
+        {
+            playerShip.bloquearRotacionPorMovimiento = true;
+        }
+        
+        // Propagar a todos los clientes
+        RpcSincronizarIniciarAtaque();
+    }
+    
+    [ClientRpc]
+    void RpcSincronizarIniciarAtaque()
+    {
+        // Ejecutar en todos los clientes
+        if (playerShip != null)
+        {
+            playerShip.bloquearRotacionPorMovimiento = true;
+        }
+        
+        Debug.Log($"[PlayerShoot] Rotación bloqueada en todos los clientes para {name}");
+    }
+
+    void DetenerDisparoAutomatico(bool limpiarObjetivo = false)
+    {
+        apuntandoAlObjetivo = false;
+        
+        // Si limpiarObjetivo es true (por ejemplo, PEM), desmarcar completamente
+        if (limpiarObjetivo)
+        {
+            objetivoBloqueado = null;
+            
+            if (playerShip != null)
+            {
+                playerShip.SetAttackTarget(null);
+            }
+            
+            Debug.Log("[PlayerShoot] Disparo detenido - Objetivo DESMARCADO (PEM u otro)");
+        }
+        else
+        {
+            // NO limpiar el attack target - mantener el objetivo marcado
+            // Solo liberamos la rotación con bloquearRotacionPorMovimiento = false
+            Debug.Log("[PlayerShoot] Disparo detenido - Objetivo sigue marcado");
+        }
+
+        if (playerShip != null)
+        {
+            playerShip.bloquearRotacionPorMovimiento = false;
+            
+            // 🔄 RESETEAR LA ROTACIÓN OBJETIVO localmente
+            playerShip.targetRotation = playerShip.transform.rotation;
+            
+            // 🔄 SINCRONIZAR EN RED: Enviar la rotación actual a todos los clientes
+            if (isLocalPlayer)
+            {
+                // Enviar la rotación ACTUAL al servidor para sincronizar con todos
+                Quaternion rotacionActual = playerShip.transform.rotation;
+                CmdSincronizarDetenerAtaque(rotacionActual);
+            }
+            
+            Debug.Log($"[PlayerShoot] Rotación objetivo reseteada a: {playerShip.transform.rotation.eulerAngles.y:F1}°");
+        }
+
+        if (missileShoot != null)
+        {
+            missileShoot.DetenerDañoMisiles();
+        }
+
+        if (disparoAutoCoroutine != null)
+        {
+            StopCoroutine(disparoAutoCoroutine);
+            disparoAutoCoroutine = null;
+        }
+    }
+    
+    [Command]
+    void CmdSincronizarDetenerAtaque(Quaternion rotacionActual)
+    {
+        // Sincronizar en el servidor con la rotación recibida
+        if (playerShip != null)
+        {
+            playerShip.bloquearRotacionPorMovimiento = false;
+            playerShip.targetRotation = rotacionActual;
+            // También actualizar la rotación del transform en el servidor
+            playerShip.transform.rotation = rotacionActual;
+        }
+        
+        // Propagar la misma rotación a todos los clientes
+        RpcSincronizarDetenerAtaque(rotacionActual);
+    }
+    
+    [ClientRpc]
+    void RpcSincronizarDetenerAtaque(Quaternion rotacionActual)
+    {
+        // Ejecutar en todos los clientes con la rotación recibida
+        if (playerShip != null)
+        {
+            playerShip.bloquearRotacionPorMovimiento = false;
+            playerShip.targetRotation = rotacionActual;
+            // También actualizar la rotación del transform en todos los clientes
+            playerShip.transform.rotation = rotacionActual;
+        }
+        
+        Debug.Log($"[PlayerShoot] Rotación liberada y reseteada en todos los clientes para {name} a {rotacionActual.eulerAngles.y:F1}°");
+    }
+    
+    /// <summary>
+    /// Método público para detener el disparo y limpiar el objetivo (usado por PEM)
+    /// </summary>
+    public void DetenerDisparoYLimpiarObjetivo()
+    {
+        // Si es el jugador local y llamado directamente (no desde RPC), usar Command
+        if (isLocalPlayer && !NetworkServer.active)
+        {
+            // Llamar al comando para sincronizar en red
+            CmdDetenerDisparoYLimpiarObjetivo();
+            return;
+        }
+        
+        // Si se llama desde RPC o es el servidor, ejecutar directamente
+        DetenerDisparoAutomatico(limpiarObjetivo: true);
+        
+        Debug.Log($"[PlayerShoot] DetenerDisparoYLimpiarObjetivo ejecutado en {name}");
+    }
+    
+    [Command]
+    void CmdDetenerDisparoYLimpiarObjetivo()
+    {
+        // Ejecutar en el servidor y propagar a todos los clientes
+        RpcDetenerDisparoYLimpiarObjetivo();
+    }
+    
+    [ClientRpc]
+    void RpcDetenerDisparoYLimpiarObjetivo()
+    {
+        // Ejecutar en todos los clientes (incluyendo el que lo llamó)
+        DetenerDisparoAutomatico(limpiarObjetivo: true);
+        
+        Debug.Log("[PlayerShoot] Disparo detenido y objetivo limpiado por red (PEM)");
+    }
+
+    IEnumerator BucleDisparoAutomatico()
+    {
+        while (apuntandoAlObjetivo)
+        {
+            Transform seleccionadoActual = (targetSelector != null) ? targetSelector.GetObjetivoActual() : null;
+            
+            // ✅ Si el objetivo cambió, actualizar en red y detener
+            if (seleccionadoActual != null && objetivoBloqueado != seleccionadoActual)
+            {
+                Debug.Log($"[PlayerShoot] Objetivo cambió durante disparo: {objetivoBloqueado?.name} → {seleccionadoActual.name}. Actualizando objetivo en red...");
+                
+                // ✅ PRIMERO: Actualizar el objetivo
+                objetivoBloqueado = seleccionadoActual;
+                
+                // ✅ SEGUNDO: Sincronizar nuevo objetivo en red ANTES de detener
+                if (playerShip != null)
+                {
+                    playerShip.SetAttackTarget(objetivoBloqueado);
+                    Debug.Log($"[PlayerShoot] Objetivo sincronizado en red: {objetivoBloqueado.name}");
+                }
+                
+                // ✅ TERCERO: Detener el ataque (el usuario debe presionar CTRL de nuevo)
+                DetenerDisparoAutomatico(limpiarObjetivo: false);
+                yield break;
+            }
+            
+            // ⚠️ VERIFICACIÓN ROBUSTA: Detectar objetos destruidos O desactivados
+            if (objetivoBloqueado == null || 
+                !objetivoBloqueado || 
+                objetivoBloqueado.gameObject == null ||
+                !objetivoBloqueado.gameObject.activeInHierarchy)
+            {
+                Debug.Log("[PlayerShoot] ⚠️ Objetivo destruido, desactivado o perdido, deteniendo disparo");
+                DetenerDisparoAutomatico(limpiarObjetivo: true); // Limpiar completamente
+                yield break;
+            }
+
+            if (playerShip != null && objetivoBloqueado != null)
+            {
+                float dist = Vector3.Distance(playerShip.transform.position, objetivoBloqueado.position);
+                if (dist > alcanceMaximo)
+                {
+                    yield return new WaitForSeconds(0.1f);
+                    continue;
+                }
+            }
+
+            if (ammoUI == null)
+                ammoUI = AmmoUI.Instance ?? FindObjectOfType<AmmoUI>();
+
+            if (ammoUI == null)
+            {
+                Debug.LogWarning("[PlayerShoot] No hay AmmoUI en la escena.");
+                DetenerDisparoAutomatico();
+                yield break;
+            }
+
+            AmmoData ammo = ammoUI.GetAmmoActual();
+            if (ammo == null)
+            {
+                Debug.LogWarning("[PlayerShoot] No hay AmmoData seleccionado.");
+                DetenerDisparoAutomatico();
+                yield break;
+            }
+
+            int costo = Mathf.Max(1, ammo.costoPorDisparo);
+            if (!ammoUI.ConsumirMunicionActual(costo))
+            {
+                Debug.Log("[PlayerShoot] Sin munición para " + ammo.nombre);
+                DetenerDisparoAutomatico();
+                yield break;
+            }
+
+            yield return DispararSecuencaVisual(objetivoBloqueado);
+
+            if (missileShoot != null && objetivoBloqueado != null)
+            {
+                if (Time.time - tiempoUltimoMisilAuto >= segundosEntreMisilesAuto)
+                {
+                    Debug.Log($"[PlayerShoot] Intentando disparar misil automático hacia {objetivoBloqueado.name}");
+                    missileShoot.DispararMisil(objetivoBloqueado);
+                    tiempoUltimoMisilAuto = Time.time;
+                }
+            }
+
+            yield return new WaitForSeconds(fireDelayBetweenGroups);
+        }
+
+        disparoAutoCoroutine = null;
+    }
+
+    void SincronizarFirePoints()
+    {
+        if (playerShip == null || !playerShip.isLocalPlayer)
+        {
+            Debug.LogWarning("[PlayerShoot] No se puede sincronizar - No es jugador local");
+            return;
+        }
+
+        var fps = playerShip.GetFirePoints();
+        if (fps != null && fps.Length > 0)
+        {
+            firePoints = fps;
+            Debug.Log($"[PlayerShoot] ✓ FirePoints sincronizados: {firePoints.Length} puntos");
+        }
+        else
+        {
+            Debug.LogWarning("[PlayerShoot] FirePoints aún no disponibles, reintentando en 0.5s...");
+            // Reintentar después de un delay
+            Invoke(nameof(ReintentarSincronizacion), 0.5f);
+        }
+    }
+
+    /// <summary>
+    /// Actualiza los fire points cuando cambia la nave (llamado desde PlayerShip.CambiarNave)
+    /// </summary>
+    public void ActualizarFirePoints(Transform[] nuevosFirePoints)
+    {
+        if (nuevosFirePoints == null || nuevosFirePoints.Length == 0)
+        {
+            Debug.LogWarning("[PlayerShoot] No se recibieron fire points válidos");
+            return;
+        }
+        
+        // Validar que los FirePoints no sean null
+        int puntosValidos = 0;
+        foreach (Transform fp in nuevosFirePoints)
+        {
+            if (fp != null) puntosValidos++;
+        }
+        
+        if (puntosValidos == 0)
+        {
+            Debug.LogError("[PlayerShoot] Todos los FirePoints recibidos son null!");
+            return;
+        }
+        
+        // Actualizar la referencia a los fire points
+        firePoints = nuevosFirePoints;
+        
+        Debug.Log($"[PlayerShoot] ✅ Fire points actualizados por cambio de nave: {firePoints.Length} puntos ({puntosValidos} válidos)");
+        
+        // 🔄 Verificar que los FirePoints estén activos
+        for (int i = 0; i < firePoints.Length; i++)
+        {
+            if (firePoints[i] != null)
+            {
+                Debug.Log($"[PlayerShoot]   FirePoint[{i}]: {firePoints[i].name} - Posición: {firePoints[i].position}");
+            }
+            else
+            {
+                Debug.LogWarning($"[PlayerShoot]   FirePoint[{i}]: NULL");
+            }
+        }
+        
+        // 🔄 Si estábamos disparando, mantener el disparo activo
+        if (apuntandoAlObjetivo && objetivoBloqueado != null)
+        {
+            Debug.Log($"[PlayerShoot] Manteniendo disparo automático a {objetivoBloqueado.name} con nuevos FirePoints...");
+            
+            // NO detener el disparo, solo actualizar el objetivo en PlayerShip
+            if (playerShip != null)
+            {
+                playerShip.SetAttackTarget(objetivoBloqueado);
+            }
+            
+            // Reiniciar la coroutine para usar los nuevos FirePoints
+            if (disparoAutoCoroutine != null)
+            {
+                StopCoroutine(disparoAutoCoroutine);
+                disparoAutoCoroutine = null;
+            }
+            
+            disparoAutoCoroutine = StartCoroutine(BucleDisparoAutomatico());
+            
+            Debug.Log("[PlayerShoot] ✅ Disparo automático reiniciado con nuevos FirePoints");
+        }
+    }
+
+    void ReintentarSincronizacion()
+    {
+        if (playerShip != null && playerShip.isLocalPlayer)
+        {
+            var fps = playerShip.GetFirePoints();
+            if (fps != null && fps.Length > 0)
+            {
+                firePoints = fps;
+                Debug.Log($"[PlayerShoot] ✓ FirePoints sincronizados en reintento: {firePoints.Length} puntos");
+            }
+            else
+            {
+                Debug.LogError("[PlayerShoot] ✗ No se pudieron sincronizar FirePoints después de reintentos");
+            }
+        }
+    }
+
+    void IntentarDisparar(bool haciaTarget)
+    {
+        if (playerShip == null || !playerShip.isLocalPlayer)
+            return;
+
+        if (Time.time < tiempoUltimoDisparo + fireDelayBetweenGroups)
+            return;
+
+        Transform target = null;
+
+        if (haciaTarget)
+        {
+            if (objetivoBloqueado != null)
+            {
+                target = objetivoBloqueado;
+            }
+            else if (targetSelector != null)
+            {
+                target = targetSelector.GetObjetivoActual();
+            }
+        }
+
+        if (haciaTarget && playerShip != null && target != null)
+        {
+            float dist = Vector3.Distance(playerShip.transform.position, target.position);
+            if (dist > alcanceMaximo)
+            {
+                Debug.Log("[PlayerShoot] Objetivo fuera de alcance, no se dispara.");
+                return;
+            }
+        }
+
+        if (ammoUI == null)
+            ammoUI = AmmoUI.Instance ?? FindObjectOfType<AmmoUI>();
+
+        if (ammoUI == null)
+        {
+            Debug.LogWarning("[PlayerShoot] No hay AmmoUI en la escena.");
+            return;
+        }
+
+        AmmoData ammo = ammoUI.GetAmmoActual();
+        if (ammo == null)
+        {
+            Debug.LogWarning("[PlayerShoot] No hay AmmoData seleccionado.");
+            return;
+        }
+
+        int costo = Mathf.Max(1, ammo.costoPorDisparo);
+        if (!ammoUI.ConsumirMunicionActual(costo))
+        {
+            Debug.Log("[PlayerShoot] Sin munición para " + ammo.nombre);
+            return;
+        }
+
+        StartCoroutine(DispararSecuencaVisual(target));
+    }
+
+    IEnumerator DispararSecuencaVisual(Transform target)
+    {
+        tiempoUltimoDisparo = Time.time;
+
+        Debug.Log($"[PlayerShoot] DispararSecuencaVisual - firePoints: {(firePoints != null ? firePoints.Length.ToString() : "NULL")}");
+
+        // ⚠️ Verificar que el objetivo todavía existe y está activo
+        if (target == null || 
+            !target || 
+            target.gameObject == null ||
+            !target.gameObject.activeInHierarchy)
+        {
+            Debug.Log("[PlayerShoot] ⚠️ Objetivo destruido o desactivado antes de disparar, cancelando");
+            yield break;
+        }
+
+        // Si no hay firePoints, usar el transform del jugador como fallback
+        if (firePoints == null || firePoints.Length == 0)
+        {
+            Debug.LogWarning("[PlayerShoot] Usando transform del jugador (sin FirePoints específicos)");
+            InstanciarLaserVisual(ammoUI.GetAmmoActual(), -1, target);
+            yield break;
+        }
+
+        Debug.Log($"[PlayerShoot] Disparando desde {firePoints.Length} FirePoints");
+
+        // Disparar desde la primera mitad de firePoints
+        int mid = firePoints.Length / 2;
+        for (int i = 0; i < mid; i++)
+        {
+            if (firePoints[i] != null)
+            {
+                Debug.Log($"[PlayerShoot] Disparando láser desde FirePoint[{i}]: {firePoints[i].name}");
+                InstanciarLaserVisual(ammoUI.GetAmmoActual(), i, target);
+            }
+            else
+            {
+                Debug.LogWarning($"[PlayerShoot] FirePoint[{i}] es NULL, saltando");
+            }
+        }
+
+        yield return new WaitForSeconds(fireDelayBetweenGroups);
+
+        // ⚠️ VERIFICAR NUEVAMENTE: El objetivo pudo haber sido destruido o desactivado durante el delay
+        if (target == null || 
+            !target || 
+            target.gameObject == null ||
+            !target.gameObject.activeInHierarchy)
+        {
+            Debug.Log("[PlayerShoot] ⚠️ Objetivo destruido o desactivado durante delay entre grupos, cancelando segundo grupo");
+            yield break;
+        }
+
+        // Disparar desde la segunda mitad
+        for (int i = mid; i < firePoints.Length; i++)
+        {
+            if (firePoints[i] != null)
+            {
+                Debug.Log($"[PlayerShoot] Disparando láser desde FirePoint[{i}]: {firePoints[i].name}");
+                InstanciarLaserVisual(ammoUI.GetAmmoActual(), i, target);
+            }
+            else
+            {
+                Debug.LogWarning($"[PlayerShoot] FirePoint[{i}] es NULL, saltando");
+            }
+        }
+    }
+
+    /// <summary>
+    /// ✅ CORREGIDO: Ahora envía el ÍNDICE del firepoint en lugar de la posición
+    /// </summary>
+    void InstanciarLaserVisual(AmmoData ammo, int firePointIndex, Transform target)
+    {
+        string ammoName = (ammo != null) ? ammo.name : string.Empty;
+
+        uint targetNetId = 0;
+        if (target != null)
+        {
+            NetworkIdentity ni = target.GetComponentInParent<NetworkIdentity>();
+            if (ni != null)
+                targetNetId = ni.netId;
+        }
+
+        // ✅ Enviar el índice del firepoint, no la posición
+        CmdSpawnLaserVisual(firePointIndex, ammoName, targetNetId);
+    }
+
+    [Command]
+    void CmdSpawnLaserVisual(int firePointIndex, string ammoName, uint targetNetId)
+    {
+        // Obtener el netId del dueño del disparo
+        uint shooterNetId = netIdentity.netId;
+        RpcSpawnLaserVisual(firePointIndex, ammoName, targetNetId, shooterNetId);
+    }
+
+    [ClientRpc]
+    void RpcSpawnLaserVisual(int firePointIndex, string ammoName, uint targetNetId, uint shooterNetId)
+    {
+        // Buscar AmmoUI si no está asignada
+        if (ammoUI == null)
+            ammoUI = AmmoUI.Instance ?? FindObjectOfType<AmmoUI>();
+
+        AmmoData ammoToUse = null;
+
+        // Buscar el AmmoData por nombre
+        if (ammoUI != null && !string.IsNullOrEmpty(ammoName))
+        {
+            var lista = ammoUI.municiones;
+            if (lista != null)
+            {
+                for (int i = 0; i < lista.Length; i++)
+                {
+                    var a = lista[i];
+                    if (a != null && a.name == ammoName)
+                    {
+                        ammoToUse = a;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (ammoToUse == null)
+        {
+            Debug.LogWarning("[PlayerShoot] No se encontró AmmoData con nombre '" + ammoName + "'");
+            return;
+        }
+
+        if (ammoToUse.laserPrefab == null)
+        {
+            Debug.LogWarning("[PlayerShoot] AmmoData '" + ammoName + "' no tiene laserPrefab asignado.");
+            return;
+        }
+
+        // ✅ CORREGIDO: Obtener la posición ACTUAL del firepoint del shooter
+        Vector3 origen = Vector3.zero;
+        Transform shooterRoot = null;
+        PlayerShip shooterShip = null;
+        
+        if (shooterNetId != 0 && NetworkClient.spawned.TryGetValue(shooterNetId, out NetworkIdentity shooterNi))
+        {
+            shooterRoot = shooterNi.transform;
+            shooterShip = shooterNi.GetComponent<PlayerShip>();
+            
+            if (shooterShip != null)
+            {
+                Transform[] shooterFirePoints = shooterShip.GetFirePoints();
+                
+                if (shooterFirePoints != null && firePointIndex >= 0 && firePointIndex < shooterFirePoints.Length && shooterFirePoints[firePointIndex] != null)
+                {
+                    // ✅ Usar la posición ACTUAL del firepoint
+                    origen = shooterFirePoints[firePointIndex].position;
+                }
+                else
+                {
+                    // Fallback: usar la posición de la nave + offset adelante
+                    origen = shooterShip.transform.position + shooterShip.transform.forward * 1.5f;
+                }
+            }
+            else
+            {
+                origen = shooterNi.transform.position + shooterNi.transform.forward * 1.5f;
+            }
+        }
+        else
+        {
+            Debug.LogWarning($"[PlayerShoot] No se encontró shooter con NetID {shooterNetId}");
+            return;
+        }
+
+        // ✅ CORREGIDO: Calcular la dirección hacia la posición ACTUAL del objetivo
+        Vector3 dir = Vector3.forward;
+        Transform targetRoot = null;
+        
+        if (targetNetId != 0 && NetworkClient.spawned.TryGetValue(targetNetId, out NetworkIdentity targetNi))
+        {
+            targetRoot = targetNi.transform;
+            
+            // ✅ Calcular dirección hacia la posición ACTUAL del objetivo
+            dir = targetRoot.position - origen;
+            dir.y = 0f;
+            
+            if (dir.sqrMagnitude > 0.01f)
+            {
+                dir = dir.normalized;
+            }
+            else
+            {
+                dir = shooterRoot != null ? shooterRoot.forward : Vector3.forward;
+            }
+        }
+        else
+        {
+            // Sin objetivo, usar la dirección forward del shooter
+            dir = shooterRoot != null ? shooterRoot.forward : Vector3.forward;
+        }
+
+        // Instanciar el láser en la posición ACTUAL
+        Quaternion rot = Quaternion.LookRotation(dir, Vector3.up);
+        GameObject laser = Instantiate(ammoToUse.laserPrefab, origen, rot);
+
+        // Configurar el componente Laser
+        Laser laserComp = laser.GetComponent<Laser>();
+        if (laserComp != null)
+        {
+            laserComp.ownerRoot = shooterRoot;
+            laserComp.targetRoot = targetRoot;
+            
+            if (targetRoot != null)
+            {
+                laserComp.useTargetPosition(targetRoot.position);
+            }
+        }
+
+        // Configurar la velocidad del láser
+        Rigidbody rb = laser.GetComponent<Rigidbody>();
+        if (rb != null)
+            rb.linearVelocity = dir * laserSpeed;
+        
+        Debug.Log($"[PlayerShoot] Láser creado - Shooter: {shooterNetId}, Target: {targetNetId}, FirePoint: {firePointIndex}, Pos: {origen}");
+    }
+
+    void ApuntarAObjetivoActual()
+    {
+        if (playerShip == null)
+        {
+            Debug.LogWarning("[PlayerShoot] playerShip es null en ApuntarAObjetivoActual");
+            DetenerDisparoAutomatico();
+            return;
+        }
+
+        // ⚠️ VERIFICACIÓN ROBUSTA: Detectar objetos destruidos O desactivados
+        if (objetivoBloqueado == null || 
+            !objetivoBloqueado || 
+            objetivoBloqueado.gameObject == null ||
+            !objetivoBloqueado.gameObject.activeInHierarchy)
+        {
+            Debug.Log("[PlayerShoot] ⚠️ Objetivo destruido, desactivado o perdido en ApuntarAObjetivoActual, deteniendo");
+            DetenerDisparoAutomatico(limpiarObjetivo: true); // Limpiar completamente
+            return;
+        }
+
+        Transform seleccionadoActual = (targetSelector != null) ? targetSelector.GetObjetivoActual() : null;
+
+        // ✅ Si el objetivo cambió, actualizar en red y detener
+        if (seleccionadoActual != null && objetivoBloqueado != seleccionadoActual)
+        {
+            Debug.Log($"[PlayerShoot] Cambiando de objetivo: {objetivoBloqueado.name} → {seleccionadoActual.name}. Actualizando objetivo en red...");
+            
+            // ✅ PRIMERO: Actualizar el objetivo
+            objetivoBloqueado = seleccionadoActual;
+            
+            // ✅ SEGUNDO: Sincronizar nuevo objetivo en red ANTES de detener
+            if (playerShip != null)
+            {
+                playerShip.SetAttackTarget(objetivoBloqueado);
+                Debug.Log($"[PlayerShoot] Objetivo sincronizado en red: {objetivoBloqueado.name}");
+            }
+            
+            // ✅ TERCERO: Detener el ataque (el usuario debe presionar CTRL de nuevo)
+            DetenerDisparoAutomatico(limpiarObjetivo: false);
+            return;
+        }
+
+        // ✅ Bloquear que el joystick cambie la rotación
+        playerShip.bloquearRotacionPorMovimiento = true;
+
+        Vector3 dir = objetivoBloqueado.position - playerShip.transform.position;
+        dir.y = 0f;
+        if (dir.sqrMagnitude < 0.0001f)
+        {
+            Debug.LogWarning("[PlayerShoot] Objetivo demasiado cerca, no rotar");
+            return;
+        }
+
+        // ✅ CORREGIDO: Solo actualizar targetRotation, dejar que FixedUpdate aplique la rotación
+        Quaternion rotObjetivo = Quaternion.LookRotation(dir.normalized, Vector3.up);
+        playerShip.targetRotation = rotObjetivo;
+        
+        // Log cada 60 frames (aproximadamente 1 vez por segundo)
+        if (Time.frameCount % 60 == 0)
+        {
+            Debug.Log($"[PlayerShoot] Apuntando a {objetivoBloqueado.name} - Rot actual: {playerShip.transform.rotation.eulerAngles.y:F1}°, Objetivo: {rotObjetivo.eulerAngles.y:F1}°");
+        }
+    }
+}
