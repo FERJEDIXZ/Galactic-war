@@ -1,0 +1,1910 @@
+using UnityEngine;
+using UnityEngine.UI;
+using Mirror;
+
+[RequireComponent(typeof(Rigidbody))]
+public class PlayerShip : NetworkBehaviour
+{
+    public static PlayerShip LocalPlayer { get; private set; }
+
+    [Header("Datos de Nave")]
+    public NaveData naveData;
+    
+    [Header("Registro de Naves (REQUERIDO)")]
+    [Tooltip("Asignar el NaveRegistry que contiene todas las naves disponibles")]
+    public NaveRegistry naveRegistry;
+
+    private Rigidbody rb;
+
+    // ---------------------------
+    // VELOCIDAD
+    // ---------------------------
+    private float velocidadBase;
+    private float velocidadActual;
+
+    [SyncVar]
+    [HideInInspector] public bool bloquearRotacionPorMovimiento = false;
+    
+    // ✅ Permitir que otros scripts (como PlayerShoot) controlen la rotación objetivo
+    private Quaternion _targetRotation;
+    public Quaternion targetRotation
+    {
+        get { return _targetRotation; }
+        set { _targetRotation = value; }
+    }
+
+    // ---------------------------
+    // INPUT (almacenado para FixedUpdate)
+    // ---------------------------
+    private Vector3 inputDirection;
+
+    // ---------------------------
+    // VIDA / ESCUDO (internos)
+    // ---------------------------
+    int vidaMax;
+
+    // ESCUDO POR CONFIGURACIÓN
+    [Header("Escudo por Configuración")]
+    [SyncVar(hook = nameof(OnEscudoMaxConfig1Changed))]
+    [SerializeField] private int escudoMaxConfig1 = 0;
+    [SyncVar(hook = nameof(OnEscudoActualConfig1Changed))]
+    [SerializeField] private int escudoActualConfig1 = 0;
+    [SerializeField] private int porcentajeAbsorcionConfig1 = 0;
+    
+    [SyncVar(hook = nameof(OnEscudoMaxConfig2Changed))]
+    [SerializeField] private int escudoMaxConfig2 = 0;
+    [SyncVar(hook = nameof(OnEscudoActualConfig2Changed))]
+    [SerializeField] private int escudoActualConfig2 = 0;
+    [SerializeField] private int porcentajeAbsorcionConfig2 = 0;
+
+    private int escudoMax;
+    private int escudoActual;
+    private int porcentajeAbsorcion;
+
+    [Header("Valores de Vida/Escudo (runtime)")]
+    [SyncVar(hook = nameof(OnVidaChanged))]
+    [SerializeField] int vidaActual;
+    [SyncVar(hook = nameof(OnConfiguracionChanged))]
+    [SerializeField] private int configuracionActiva = 1;
+
+    // ---------------------------
+    // BONUS (solo debug)
+    // ---------------------------
+    [Header("Bonus de Equipamiento (debug)")]
+    [SyncVar(hook = nameof(OnBonusVelocidadChanged))]
+    [SerializeField] float bonusVelocidad = 0f;
+    [SyncVar]
+    [SerializeField] int bonusEscudo = 0;
+    [SyncVar]
+    [SerializeField] int bonusDaño = 0;
+
+    private GameObject naveVisual;
+    private bool naveVisualInstanciada = false;
+    
+    // ---------------------------
+    // SINCRONIZACIÓN DE NAVE VISUAL
+    // ---------------------------
+    [SyncVar(hook = nameof(OnNaveIndexChanged))]
+    private int naveIndex = -1;
+    
+    [SyncVar(hook = nameof(OnVisualRotationChanged))]
+    private Vector3 visualRotation;
+    [SyncVar(hook = nameof(OnVisualScaleChanged))]
+    private Vector3 visualScale;
+    [SyncVar]
+    private Vector3 visualPosition;
+    [SyncVar(hook = nameof(OnVisualDataSyncedChanged))]
+    private bool visualDataSynced = false;
+
+    // ---------------------------
+    // OBJETIVO DE ATAQUE
+    // ---------------------------
+    [SyncVar(hook = nameof(OnTargetNetIdChanged))]
+    private uint currentTargetNetId = 0;
+
+    private Transform currentTargetTransform = null;
+
+    // ---------------------------
+    // FIRE POINTS (runtime)
+    // ---------------------------
+    [Header("Fire Points (runtime)")]
+    [SerializeField] private Transform[] firePoints;
+
+    public Transform[] GetFirePoints() => firePoints;
+
+    // ---------------------------
+    // UI de Vida / Escudo
+    // ---------------------------
+    [Header("Barras de Vida/Escudo (dentro del prefab Player)")]
+    public string healthBarPath = "Canvas/PlayerHealthBar";
+    public string shieldBarPath = "Canvas/PlayerShieldBar";
+
+    private Slider healthBarInstance;
+    private Slider shieldBarInstance;
+    private Transform healthBarRoot;
+    private Transform shieldBarRoot;
+
+    [Header("Regeneración de Escudo")]
+    [Range(0f, 100f)]
+    public float porcentajeRegenEscudoPorSegundo = 0f;
+    public float tiempoEsperaRegenEscudo = 5f;
+
+    private float escudoRegenAcumulado = 0f;
+    private float tiempoUltimoDañoEscudo = 0f;
+
+    [Header("Regeneración de Vida")]
+    [Range(0f, 100f)]
+    public float porcentajeRegenVidaPorSegundo = 0f;
+    public float tiempoEsperaRegenVida = 5f;
+
+    private float vidaRegenAcumulado = 0f;
+    private float tiempoUltimoDañoVida = 0f;
+
+    [Header("Posición / escala barras")]
+    public Vector3 healthBarLocalPosition = new Vector3(0, 2.2f, 0);
+    public Vector3 healthBarLocalScale = Vector3.one;
+    public Vector3 shieldBarLocalPosition = new Vector3(0, 1.8f, 0);
+    public Vector3 shieldBarLocalScale = Vector3.one;
+
+    // ---------------------------
+    // REPAIR BOT
+    // ---------------------------
+    [Header("Repair Bot")]
+    public GameObject repairBotPrefab;
+
+    private GameObject repairBotInstance;
+    private bool repairBotActivo = false;
+
+    private MinimapCamera minimapCamera;
+
+    // ---------------------------
+    // SISTEMA DE INVULNERABILIDAD
+    // ---------------------------
+    [Header("Sistema de Invulnerabilidad")]
+    [SerializeField] private bool esInvulnerable = false;
+    private float tiempoFinInvulnerabilidad = 0f;
+
+    // ---------------------------
+    // SISTEMA PEM (NO SELECCIONABLE)
+    // ---------------------------
+    [Header("Sistema PEM - No Seleccionable")]
+    [SyncVar(hook = nameof(OnNoSeleccionableChanged))]
+    [SerializeField] private bool esNoSeleccionable = false;
+    private float tiempoFinNoSeleccionable = 0f;
+
+    [Header("Debug")]
+    [SerializeField] private bool enableDebugLogs = false;
+
+    void Awake()
+    {
+        if (!Debug.isDebugBuild && !enableDebugLogs)
+            Debug.unityLogger.logEnabled = false;
+        
+        // Inicializar el registro de naves
+        if (naveRegistry != null)
+        {
+            naveRegistry.Inicializar();
+        }
+    }
+
+    // =====================================================
+    // INICIALIZACIÓN DE RED
+    // =====================================================
+    
+    public override void OnStartServer()
+    {
+        base.OnStartServer();
+        
+        if (naveData != null && naveRegistry != null)
+        {
+            // Sincronizar el índice de la nave
+            naveIndex = naveRegistry.GetIndiceDeNave(naveData);
+            
+            // Sincronizar datos visuales
+            visualRotation = naveData.rotacionLocal;
+            visualScale = naveData.escalaLocal;
+            visualPosition = naveData.posicionLocal;
+            visualDataSynced = true;
+        }
+    }
+
+    public override void OnStartClient()
+    {
+        base.OnStartClient();
+        
+        // Esperar a que las SyncVars lleguen antes de instanciar
+        if (visualDataSynced || isLocalPlayer)
+        {
+            InstanciarNaveVisual();
+        }
+        else
+        {
+            // Esperar un poco más para jugadores remotos
+            Invoke(nameof(InstanciarNaveVisual), 0.2f);
+        }
+    }
+
+    public override void OnStartLocalPlayer()
+    {
+        base.OnStartLocalPlayer();
+        
+        // Enviar el índice de nave al servidor
+        if (naveRegistry != null && naveData != null)
+        {
+            int index = naveRegistry.GetIndiceDeNave(naveData);
+            CmdSetNaveIndex(index);
+        }
+    }
+
+    [Command]
+    void CmdSetNaveIndex(int index)
+    {
+        // El servidor actualiza el naveIndex, que se sincroniza a todos los clientes
+        naveIndex = index;
+        
+        // También actualizar los datos visuales basados en la nave
+        if (naveRegistry != null)
+        {
+            NaveData data = naveRegistry.GetNavePorIndice(index);
+            if (data != null)
+            {
+                visualRotation = data.rotacionLocal;
+                visualScale = data.escalaLocal;
+                visualPosition = data.posicionLocal;
+                visualDataSynced = true;
+            }
+        }
+    }
+
+    // =====================================================
+    // CICLO DE VIDA
+    // =====================================================
+
+    void Start()
+    {
+        rb = GetComponent<Rigidbody>();
+        rb.interpolation = RigidbodyInterpolation.Interpolate;
+
+        AplicarDatosDeNave();
+        BuscarBarrasUI();
+
+        if (isLocalPlayer)
+        {
+            LocalPlayer = this;
+            
+            if (healthBarRoot != null) healthBarRoot.gameObject.SetActive(true);
+            if (shieldBarRoot != null) shieldBarRoot.gameObject.SetActive(true);
+            
+            minimapCamera = FindObjectOfType<MinimapCamera>();
+            targetRotation = transform.rotation;
+            
+            ConfigurarCamara();
+        }
+        else
+        {
+            if (healthBarRoot != null) healthBarRoot.gameObject.SetActive(false);
+            if (shieldBarRoot != null) shieldBarRoot.gameObject.SetActive(false);
+        }
+
+        ActualizarBarrasUI();
+    }
+
+    void Update()
+    {
+        if (isLocalPlayer)
+        {
+            bool enMovimientoAutomatico = minimapCamera != null && minimapCamera.IsAutoMoving();
+            
+            if (!enMovimientoAutomatico)
+            {
+                float h = SimpleJoystick.Horizontal;
+                float v = SimpleJoystick.Vertical;
+                inputDirection = new Vector3(h, 0, v);
+
+                if (!bloquearRotacionPorMovimiento && inputDirection.sqrMagnitude > 0.01f)
+                {
+                    targetRotation = Quaternion.LookRotation(inputDirection, Vector3.up);
+                }
+            }
+            else
+            {
+                float h = SimpleJoystick.Horizontal;
+                float v = SimpleJoystick.Vertical;
+                
+                if ((h * h + v * v) > 0.01f)
+                {
+                    minimapCamera.CancelClickToMove();
+                    inputDirection = new Vector3(h, 0, v);
+                }
+                else
+                {
+                    inputDirection = minimapCamera.GetAutoMoveDirection();
+                }
+
+                if (!bloquearRotacionPorMovimiento && inputDirection.sqrMagnitude > 0.01f)
+                {
+                    targetRotation = Quaternion.LookRotation(inputDirection, Vector3.up);
+                }
+            }
+        }
+
+        if (isServer)
+        {
+            RegenerarEscudo(Time.deltaTime);
+            RegenerarVida(Time.deltaTime);
+            
+            // 🛡️ Verificar si la invulnerabilidad terminó
+            if (esInvulnerable && Time.time >= tiempoFinInvulnerabilidad)
+            {
+                esInvulnerable = false;
+                Debug.Log($"[PlayerShip] {name} ya NO es invulnerable");
+            }
+            
+            // 📡 Verificar si el PEM (no seleccionable) terminó
+            if (esNoSeleccionable && Time.time >= tiempoFinNoSeleccionable)
+            {
+                esNoSeleccionable = false;
+                Debug.Log($"[PlayerShip] {name} ya puede ser SELECCIONADO nuevamente");
+            }
+        }
+    }
+
+    void FixedUpdate()
+    {
+        if (!isLocalPlayer)
+            return;
+
+        rb.linearVelocity = inputDirection * velocidadActual;
+
+        // ✅ UNIFICADO: Solo aquí se aplica la rotación para el jugador local
+        if (bloquearRotacionPorMovimiento || inputDirection.sqrMagnitude > 0.01f)
+        {
+            transform.rotation = Quaternion.Slerp(
+                transform.rotation,
+                targetRotation,
+                10f * Time.fixedDeltaTime
+            );
+        }
+    }
+
+    void LateUpdate()
+    {
+        // ✅ CORREGIDO: Rotación INSTANTÁNEA para jugadores remotos que atacan
+        // Esto es puramente visual - la nave remota siempre apunta directamente al objetivo
+        if (!isLocalPlayer && IsAttacking() && currentTargetTransform != null && bloquearRotacionPorMovimiento)
+        {
+            Vector3 dir = currentTargetTransform.position - transform.position;
+            dir.y = 0f;
+
+            if (dir.sqrMagnitude > 0.01f)
+            {
+                // ✅ CAMBIO: Rotación DIRECTA sin Slerp para que siempre apunte al objetivo
+                Quaternion rotObjetivo = Quaternion.LookRotation(dir.normalized, Vector3.up);
+                transform.rotation = rotObjetivo;
+            }
+        }
+    }
+
+    void OnDestroy()
+    {
+        if (LocalPlayer == this)
+        {
+            LocalPlayer = null;
+        }
+    }
+
+    // =====================================================
+    // SINCRONIZACIÓN DE NAVE VISUAL
+    // =====================================================
+
+    void OnNaveIndexChanged(int oldValue, int newValue)
+    {
+        naveIndex = newValue;
+        
+        Debug.Log($"[PlayerShip] OnNaveIndexChanged: {oldValue} → {newValue}, isLocalPlayer: {isLocalPlayer}, isServer: {isServer}, isClient: {isClient}, netId: {netId}");
+        
+        // ⚠️ Si es el jugador local, NO hacer nada aquí
+        // El visual ya fue actualizado en CambiarNave() > ActualizarVisualDeNave()
+        // Si actualizamos aquí, destruiremos los FirePoints que acabamos de crear
+        if (isLocalPlayer)
+        {
+            Debug.Log($"[PlayerShip] ✅ Jugador local (netId: {netId}) - OnNaveIndexChanged IGNORADO (visual ya actualizado)");
+            return;
+        }
+        
+        Debug.Log($"[PlayerShip] Jugador remoto (netId: {netId}) - Actualizando visual por cambio de nave");
+        
+        // Solo para jugadores REMOTOS: actualizar su visual cuando vemos que cambió de nave
+        if (naveVisualInstanciada && naveVisual != null)
+        {
+            Destroy(naveVisual);
+            naveVisual = null;
+            naveVisualInstanciada = false;
+        }
+        
+        // Instanciar el nuevo visual
+        InstanciarNaveVisual();
+        
+        // 🔫 NOTIFICAR A PLAYERSHOOT DE LOS NUEVOS FIREPOINTS
+        StartCoroutine(NotificarFirePointsConDelay());
+    }
+    
+    System.Collections.IEnumerator NotificarFirePointsConDelay()
+    {
+        yield return null; // Esperar un frame
+        
+        if (firePoints != null && firePoints.Length > 0)
+        {
+            PlayerShoot playerShoot = GetComponent<PlayerShoot>();
+            if (playerShoot != null)
+            {
+                playerShoot.ActualizarFirePoints(firePoints);
+                Debug.Log($"[PlayerShip] FirePoints actualizados en jugador remoto: {firePoints.Length} puntos");
+            }
+        }
+    }
+
+    void OnVisualDataSyncedChanged(bool oldValue, bool newValue)
+    {
+        visualDataSynced = newValue;
+        
+        // Si los datos están sincronizados y aún no hemos instanciado, hacerlo ahora
+        if (newValue && !naveVisualInstanciada && !isLocalPlayer)
+        {
+            InstanciarNaveVisual();
+        }
+    }
+
+    // =====================================================
+    // INICIALIZACIÓN NAVE
+    // =====================================================
+
+    void AplicarDatosDeNave()
+    {
+        // Obtener NaveData correcto según si es local o remoto
+        NaveData dataToUse = ObtenerNaveDataActual();
+        
+        if (dataToUse == null)
+        {
+            Debug.LogError("[PlayerShip] No hay NaveData disponible.");
+            return;
+        }
+
+        velocidadBase = dataToUse.velocidadBase;
+        vidaMax = Mathf.RoundToInt(dataToUse.vidaMax);
+
+        if (vidaActual <= 0 || vidaActual > vidaMax)
+            vidaActual = vidaMax;
+
+        if (escudoMaxConfig1 < 0) escudoMaxConfig1 = 0;
+        if (escudoActualConfig1 < 0) escudoActualConfig1 = 0;
+        if (escudoMaxConfig2 < 0) escudoMaxConfig2 = 0;
+        if (escudoActualConfig2 < 0) escudoActualConfig2 = 0;
+
+        CargarConfiguracion(configuracionActiva);
+        RecalcularVelocidadTotal();
+        ActualizarBarrasUI();
+    }
+
+    NaveData ObtenerNaveDataActual()
+    {
+        // Si es el jugador local, usar el naveData asignado en el inspector
+        if (isLocalPlayer)
+        {
+            return naveData;
+        }
+        
+        // Para jugadores remotos, obtener del registro usando el índice sincronizado
+        if (naveRegistry != null && naveIndex >= 0)
+        {
+            return naveRegistry.GetNavePorIndice(naveIndex);
+        }
+        
+        // Fallback al naveData local
+        return naveData;
+    }
+
+    void InstanciarNaveVisual()
+    {
+        if (naveVisualInstanciada)
+        {
+            return;
+        }
+        
+        // Obtener el NaveData correcto
+        NaveData dataToUse;
+        
+        if (isLocalPlayer)
+        {
+            // Jugador local: usar su propio naveData
+            dataToUse = naveData;
+        }
+        else
+        {
+            // Jugador remoto: obtener del registro usando el índice sincronizado
+            if (naveRegistry != null && naveIndex >= 0)
+            {
+                dataToUse = naveRegistry.GetNavePorIndice(naveIndex);
+            }
+            else if (NaveRegistry.Instance != null && naveIndex >= 0)
+            {
+                dataToUse = NaveRegistry.Instance.GetNavePorIndice(naveIndex);
+            }
+            else
+            {
+                Debug.LogWarning($"[PlayerShip] No se pudo obtener NaveData para jugador remoto. naveIndex={naveIndex}");
+                return;
+            }
+        }
+        
+        if (dataToUse == null || dataToUse.prefabNave == null)
+        {
+            Debug.LogError("[PlayerShip] NaveData o prefabNave es null.");
+            return;
+        }
+
+        naveVisual = Instantiate(dataToUse.prefabNave, transform);
+        
+        // Usar datos sincronizados para posición/rotación/escala si están disponibles
+        if (visualDataSynced && !isLocalPlayer)
+        {
+            naveVisual.transform.localPosition = visualPosition;
+            naveVisual.transform.localRotation = Quaternion.Euler(visualRotation);
+            naveVisual.transform.localScale = visualScale;
+        }
+        else
+        {
+            naveVisual.transform.localPosition = dataToUse.posicionLocal;
+            naveVisual.transform.localRotation = Quaternion.Euler(dataToUse.rotacionLocal);
+            naveVisual.transform.localScale = dataToUse.escalaLocal;
+        }
+
+        naveVisualInstanciada = true;
+
+        CrearFirePointsDesdeNaveData(dataToUse);
+    }
+
+    void CrearFirePointsDesdeNaveData(NaveData dataToUse)
+    {
+        if (dataToUse == null || dataToUse.firePointsOffsets == null || dataToUse.firePointsOffsets.Count == 0)
+        {
+            firePoints = null;
+            return;
+        }
+
+        firePoints = new Transform[dataToUse.firePointsOffsets.Count];
+
+        for (int i = 0; i < dataToUse.firePointsOffsets.Count; i++)
+        {
+            var offset = dataToUse.firePointsOffsets[i];
+            if (offset == null) continue;
+
+            GameObject go = new GameObject($"FirePoint_{i}");
+            go.transform.SetParent(naveVisual.transform, false);
+            go.transform.localPosition = offset.localPosition;
+            go.transform.localRotation = Quaternion.Euler(offset.localRotation);
+
+            firePoints[i] = go.transform;
+        }
+        
+        Debug.Log($"[PlayerShip] ✓ FirePoints creados: {firePoints.Length} para {(isLocalPlayer ? "LOCAL" : "REMOTO")} - NaveIndex: {naveIndex}");
+    }
+
+    // =====================================================
+    // BÚSQUEDA DE BARRAS EN EL PREFAB
+    // =====================================================
+
+    void BuscarBarrasUI()
+    {
+        if (!string.IsNullOrEmpty(healthBarPath))
+        {
+            Transform tHealth = transform.Find(healthBarPath);
+            if (tHealth != null)
+            {
+                healthBarInstance = tHealth.GetComponentInChildren<Slider>();
+                healthBarRoot = tHealth;
+                tHealth.localPosition = healthBarLocalPosition;
+                tHealth.localScale = healthBarLocalScale;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(shieldBarPath))
+        {
+            Transform tShield = transform.Find(shieldBarPath);
+            if (tShield != null)
+            {
+                shieldBarInstance = tShield.GetComponentInChildren<Slider>();
+                shieldBarRoot = tShield;
+                tShield.localPosition = shieldBarLocalPosition;
+                tShield.localScale = shieldBarLocalScale;
+            }
+        }
+
+        if (healthBarInstance != null)
+        {
+            healthBarInstance.minValue = 0f;
+            healthBarInstance.wholeNumbers = false;
+        }
+
+        if (shieldBarInstance != null)
+        {
+            shieldBarInstance.minValue = 0f;
+            shieldBarInstance.wholeNumbers = false;
+        }
+    }
+
+    void ConfigurarCamara()
+    {
+        Camera cam = Camera.main;
+        if (cam == null) return;
+
+        CameraFollow follow = cam.GetComponent<CameraFollow>();
+        if (follow == null)
+            follow = cam.gameObject.AddComponent<CameraFollow>();
+
+        follow.target = transform;
+    }
+
+    // =====================================================
+    // BONUS DESDE EQUIPMENTPANEL
+    // =====================================================
+
+    public void SetBonusVelocidad(float bonus)
+    {
+        if (!isServer)
+        {
+            CmdSetBonusVelocidad(bonus);
+            return;
+        }
+        
+        bonusVelocidad = bonus;
+        RecalcularVelocidadTotal();
+    }
+
+    [Command]
+    void CmdSetBonusVelocidad(float bonus)
+    {
+        SetBonusVelocidad(bonus);
+    }
+
+    public void SetBonusEscudo(int totalEscudoEquipado)
+    {
+        SetBonusEscudoParaConfiguracion(totalEscudoEquipado, 50, configuracionActiva);
+    }
+
+    public void SetBonusEscudoParaConfiguracion(int totalEscudoEquipado, int porcentajeAbsorcionPromedio, int numeroConfig)
+    {
+        if (!isServer)
+        {
+            CmdSetBonusEscudoParaConfiguracion(totalEscudoEquipado, porcentajeAbsorcionPromedio, numeroConfig);
+            return;
+        }
+
+        bonusEscudo = totalEscudoEquipado;
+
+        if (numeroConfig == 1)
+        {
+            int escudoMaxAnterior = escudoMaxConfig1;
+            escudoMaxConfig1 = Mathf.Max(0, totalEscudoEquipado);
+            
+            if (escudoMaxAnterior == 0 && escudoMaxConfig1 > 0)
+            {
+                escudoActualConfig1 = escudoMaxConfig1;
+            }
+            else
+            {
+                escudoActualConfig1 = Mathf.Clamp(escudoActualConfig1, 0, escudoMaxConfig1);
+            }
+            
+            porcentajeAbsorcionConfig1 = Mathf.Clamp(porcentajeAbsorcionPromedio, 0, 100);
+            
+            if (configuracionActiva == 1)
+            {
+                escudoMax = escudoMaxConfig1;
+                escudoActual = escudoActualConfig1;
+                porcentajeAbsorcion = porcentajeAbsorcionConfig1;
+                ActualizarBarrasUI();
+            }
+        }
+        else
+        {
+            int escudoMaxAnterior = escudoMaxConfig2;
+            escudoMaxConfig2 = Mathf.Max(0, totalEscudoEquipado);
+            
+            if (escudoMaxAnterior == 0 && escudoMaxConfig2 > 0)
+            {
+                escudoActualConfig2 = escudoMaxConfig2;
+            }
+            else
+            {
+                escudoActualConfig2 = Mathf.Clamp(escudoActualConfig2, 0, escudoMaxConfig2);
+            }
+            
+            porcentajeAbsorcionConfig2 = Mathf.Clamp(porcentajeAbsorcionPromedio, 0, 100);
+            
+            if (configuracionActiva == 2)
+            {
+                escudoMax = escudoMaxConfig2;
+                escudoActual = escudoActualConfig2;
+                porcentajeAbsorcion = porcentajeAbsorcionConfig2;
+                ActualizarBarrasUI();
+            }
+        }
+    }
+
+    [Command]
+    void CmdSetBonusEscudoParaConfiguracion(int totalEscudoEquipado, int porcentajeAbsorcionPromedio, int numeroConfig)
+    {
+        SetBonusEscudoParaConfiguracion(totalEscudoEquipado, porcentajeAbsorcionPromedio, numeroConfig);
+    }
+
+    void RegenerarEscudo(float deltaTime)
+    {
+        if (escudoMax <= 0) return;
+        if (escudoActual >= escudoMax) return;
+        if (porcentajeRegenEscudoPorSegundo <= 0f) return;
+
+        if (Time.time - tiempoUltimoDañoEscudo < tiempoEsperaRegenEscudo)
+            return;
+
+        float regenPorSegundo = escudoMax * (porcentajeRegenEscudoPorSegundo / 100f);
+        float regenEsteFrame = regenPorSegundo * deltaTime;
+
+        escudoRegenAcumulado += regenEsteFrame;
+
+        if (escudoRegenAcumulado >= 1f)
+        {
+            int puntos = Mathf.FloorToInt(escudoRegenAcumulado);
+            escudoRegenAcumulado -= puntos;
+
+            escudoActual = Mathf.Min(escudoMax, escudoActual + puntos);
+            
+            if (configuracionActiva == 1)
+            {
+                escudoActualConfig1 = escudoActual;
+            }
+            else if (configuracionActiva == 2)
+            {
+                escudoActualConfig2 = escudoActual;
+            }
+            
+            ActualizarBarrasUI();
+        }
+    }
+
+    void RegenerarVida(float deltaTime)
+    {
+        if (vidaMax <= 0) return;
+        if (vidaActual >= vidaMax)
+        {
+            DesactivarRepairBot();
+            return;
+        }
+        if (porcentajeRegenVidaPorSegundo <= 0f)
+        {
+            DesactivarRepairBot();
+            return;
+        }
+
+        if (Time.time - tiempoUltimoDañoVida < tiempoEsperaRegenVida)
+        {
+            DesactivarRepairBot();
+            return;
+        }
+
+        ActivarRepairBot();
+
+        float regenPorSegundo = vidaMax * (porcentajeRegenVidaPorSegundo / 100f);
+        float regenEsteFrame = regenPorSegundo * deltaTime;
+
+        vidaRegenAcumulado += regenEsteFrame;
+
+        if (vidaRegenAcumulado >= 1f)
+        {
+            int puntos = Mathf.FloorToInt(vidaRegenAcumulado);
+            vidaRegenAcumulado -= puntos;
+
+            vidaActual = Mathf.Min(vidaMax, vidaActual + puntos);
+            ActualizarBarrasUI();
+        }
+    }
+
+    public void SetBonusDaño(int bonus)
+    {
+        if (!isServer)
+        {
+            CmdSetBonusDaño(bonus);
+            return;
+        }
+        
+        bonusDaño = bonus;
+    }
+
+    [Command]
+    void CmdSetBonusDaño(int bonus)
+    {
+        SetBonusDaño(bonus);
+    }
+
+    void RecalcularVelocidadTotal()
+    {
+        velocidadActual = velocidadBase + bonusVelocidad;
+    }
+
+    // =====================================================
+    // SINCRONIZACIÓN DE OBJETIVO DE ATAQUE
+    // =====================================================
+
+    public void SetAttackTarget(Transform target)
+    {
+        if (!isLocalPlayer) return;
+        
+        uint newNetId = 0;
+        if (target != null)
+        {
+            NetworkIdentity ni = target.GetComponent<NetworkIdentity>();
+            if (ni != null)
+                newNetId = ni.netId;
+        }
+        
+        if (newNetId != currentTargetNetId)
+        {
+            CmdSetAttackTarget(newNetId);
+        }
+    }
+
+    [Command]
+    void CmdSetAttackTarget(uint targetNetId)
+    {
+        currentTargetNetId = targetNetId;
+    }
+
+    void OnTargetNetIdChanged(uint oldValue, uint newValue)
+    {
+        currentTargetNetId = newValue;
+        
+        if (newValue == 0)
+        {
+            currentTargetTransform = null;
+            
+            // Si es el jugador local y perdió su objetivo, limpiar el TargetSelector
+            if (isLocalPlayer)
+            {
+                Debug.Log($"[PlayerShip] {name} perdió su objetivo (desmarcado)");
+                
+                // Buscar el TargetSelector y limpiar el marcador visual
+                TargetSelector selector = FindObjectOfType<TargetSelector>();
+                if (selector != null)
+                {
+                    selector.Deseleccionar();
+                }
+            }
+        }
+        else
+        {
+            if (NetworkClient.spawned.TryGetValue(newValue, out NetworkIdentity ni))
+            {
+                currentTargetTransform = ni.transform;
+                Debug.Log($"[PlayerShip] {name} ahora ataca a {currentTargetTransform.name}");
+            }
+            else
+            {
+                currentTargetTransform = null;
+            }
+        }
+    }
+
+    public Transform GetCurrentAttackTarget()
+    {
+        return currentTargetTransform;
+    }
+
+    public bool IsAttacking()
+    {
+        return currentTargetNetId != 0 && currentTargetTransform != null;
+    }
+
+    // =====================================================
+    // SISTEMA DE CONFIGURACIONES
+    // =====================================================
+
+    public void CambiarConfiguracion(int numeroConfig)
+    {
+        if (numeroConfig != 1 && numeroConfig != 2)
+        {
+            Debug.LogError($"[PlayerShip] Configuración inválida: {numeroConfig}");
+            return;
+        }
+
+        if (configuracionActiva == numeroConfig)
+        {
+            return;
+        }
+
+        if (!isServer)
+        {
+            CmdCambiarConfiguracion(numeroConfig);
+            return;
+        }
+
+        GuardarEstadoConfiguracion();
+        configuracionActiva = numeroConfig;
+        CargarConfiguracion(numeroConfig);
+    }
+
+    [Command]
+    void CmdCambiarConfiguracion(int numeroConfig)
+    {
+        CambiarConfiguracion(numeroConfig);
+    }
+
+    private void GuardarEstadoConfiguracion()
+    {
+        if (!isServer)
+        {
+            CmdGuardarEstadoConfiguracion(configuracionActiva, escudoMax, escudoActual);
+            return;
+        }
+
+        if (configuracionActiva == 1)
+        {
+            escudoMaxConfig1 = escudoMax;
+            escudoActualConfig1 = escudoActual;
+        }
+        else
+        {
+            escudoMaxConfig2 = escudoMax;
+            escudoActualConfig2 = escudoActual;
+        }
+    }
+
+    [Command]
+    void CmdGuardarEstadoConfiguracion(int configNum, int maxEscudo, int actualEscudo)
+    {
+        if (configNum == 1)
+        {
+            escudoMaxConfig1 = maxEscudo;
+            escudoActualConfig1 = actualEscudo;
+        }
+        else if (configNum == 2)
+        {
+            escudoMaxConfig2 = maxEscudo;
+            escudoActualConfig2 = actualEscudo;
+        }
+    }
+
+    private void CargarConfiguracion(int numeroConfig)
+    {
+        if (numeroConfig == 1)
+        {
+            escudoMax = escudoMaxConfig1;
+            escudoActual = escudoActualConfig1;
+            porcentajeAbsorcion = porcentajeAbsorcionConfig1;
+        }
+        else
+        {
+            escudoMax = escudoMaxConfig2;
+            escudoActual = escudoActualConfig2;
+            porcentajeAbsorcion = porcentajeAbsorcionConfig2;
+        }
+
+        escudoActual = Mathf.Clamp(escudoActual, 0, escudoMax);
+        ActualizarBarrasUI();
+    }
+
+    // =====================================================
+    // BARRAS UI
+    // =====================================================
+
+    void ActualizarBarrasUI()
+    {
+        vidaActual = Mathf.Clamp(vidaActual, 0, vidaMax);
+        escudoActual = Mathf.Clamp(escudoActual, 0, escudoMax);
+
+        if (healthBarInstance != null)
+        {
+            healthBarInstance.maxValue = vidaMax;
+            healthBarInstance.value = vidaActual;
+        }
+
+        if (shieldBarInstance != null)
+        {
+            shieldBarInstance.maxValue = escudoMax;
+            shieldBarInstance.value = escudoActual;
+        }
+    }
+
+    // =====================================================
+    // HOOKS DE SINCRONIZACIÓN
+    // =====================================================
+
+    void OnVidaChanged(int oldValue, int newValue)
+    {
+        vidaActual = newValue;
+        ActualizarBarrasUI();
+    }
+
+    void OnConfiguracionChanged(int oldValue, int newValue)
+    {
+        if (oldValue != newValue && newValue >= 1 && newValue <= 2)
+        {
+            configuracionActiva = newValue;
+            CargarConfiguracion(newValue);
+        }
+    }
+
+    void OnBonusVelocidadChanged(float oldValue, float newValue)
+    {
+        bonusVelocidad = newValue;
+        RecalcularVelocidadTotal();
+    }
+
+    void OnEscudoMaxConfig1Changed(int oldValue, int newValue)
+    {
+        escudoMaxConfig1 = newValue;
+        
+        if (configuracionActiva == 1)
+        {
+            escudoMax = newValue;
+            ActualizarBarrasUI();
+        }
+    }
+
+    void OnEscudoActualConfig1Changed(int oldValue, int newValue)
+    {
+        escudoActualConfig1 = newValue;
+        
+        if (configuracionActiva == 1)
+        {
+            escudoActual = newValue;
+            ActualizarBarrasUI();
+        }
+    }
+
+    void OnEscudoMaxConfig2Changed(int oldValue, int newValue)
+    {
+        escudoMaxConfig2 = newValue;
+        
+        if (configuracionActiva == 2)
+        {
+            escudoMax = newValue;
+            ActualizarBarrasUI();
+        }
+    }
+
+    void OnEscudoActualConfig2Changed(int oldValue, int newValue)
+    {
+        escudoActualConfig2 = newValue;
+        
+        if (configuracionActiva == 2)
+        {
+            escudoActual = newValue;
+            ActualizarBarrasUI();
+        }
+    }
+
+    void OnVisualRotationChanged(Vector3 oldValue, Vector3 newValue)
+    {
+        visualRotation = newValue;
+        
+        if (naveVisual != null)
+        {
+            naveVisual.transform.localRotation = Quaternion.Euler(newValue);
+        }
+    }
+
+    void OnVisualScaleChanged(Vector3 oldValue, Vector3 newValue)
+    {
+        visualScale = newValue;
+        
+        if (naveVisual != null)
+        {
+            naveVisual.transform.localScale = newValue;
+        }
+    }
+
+    public void RecibirDaño(int cantidad)
+    {
+        // 🛡️ Si es invulnerable, no recibe daño
+        if (esInvulnerable)
+        {
+            Debug.Log($"[PlayerShip] {name} es invulnerable, daño bloqueado: {cantidad}");
+            return;
+        }
+
+        int dañoTotal = cantidad;
+        
+        if (escudoActual > 0 && porcentajeAbsorcion > 0)
+        {
+            int dañoParaEscudo = Mathf.RoundToInt(cantidad * (porcentajeAbsorcion / 100f));
+            int dañoParaVida = cantidad - dañoParaEscudo;
+            
+            int dañoAbsorbido = Mathf.Min(escudoActual, dañoParaEscudo);
+            escudoActual -= dañoAbsorbido;
+            
+            int dañoNoAbsorbido = dañoParaEscudo - dañoAbsorbido;
+            dañoParaVida += dañoNoAbsorbido;
+            
+            tiempoUltimoDañoEscudo = Time.time;
+            
+            if (configuracionActiva == 1)
+            {
+                escudoActualConfig1 = escudoActual;
+            }
+            else
+            {
+                escudoActualConfig2 = escudoActual;
+            }
+            
+            if (dañoParaVida > 0)
+            {
+                vidaActual = Mathf.Max(0, vidaActual - dañoParaVida);
+                tiempoUltimoDañoVida = Time.time;
+            }
+        }
+        else
+        {
+            vidaActual = Mathf.Max(0, vidaActual - cantidad);
+            tiempoUltimoDañoVida = Time.time;
+            tiempoUltimoDañoEscudo = Time.time;
+        }
+
+        ActualizarBarrasUI();
+        
+        if (DamageTextManager.Instance != null)
+        {
+            DamageTextManager.Instance.ShowDamage(dañoTotal, transform.position, Color.red, netId);
+        }
+    }
+
+    // =====================================================
+    // GETTERS
+    // =====================================================
+
+    public float GetVelocidadBase() => velocidadBase;
+    public float GetVelocidadActual() => velocidadActual;
+    public int GetVidaMax() => vidaMax;
+    public int GetVidaActual() => vidaActual;
+    public int GetEscudoMax() => escudoMax;
+    public int GetEscudoActual() => escudoActual;
+    public int GetBonusDaño() => bonusDaño;
+
+    // =====================================================
+    // ROBO DE ESCUDO
+    // =====================================================
+
+    public int RobarEscudo(int cantidadArobar)
+    {
+        int escudoRobado = Mathf.Min(escudoActual, cantidadArobar);
+        
+        if (escudoRobado > 0)
+        {
+            escudoActual -= escudoRobado;
+            
+            if (configuracionActiva == 1)
+            {
+                escudoActualConfig1 = escudoActual;
+            }
+            else if (configuracionActiva == 2)
+            {
+                escudoActualConfig2 = escudoActual;
+            }
+            
+            ActualizarBarrasUI();
+        }
+        
+        return escudoRobado;
+    }
+
+    public void AgregarEscudoRobado(int cantidad)
+    {
+        if (cantidad <= 0) return;
+        
+        escudoActual = Mathf.Min(escudoMax, escudoActual + cantidad);
+        
+        if (configuracionActiva == 1)
+        {
+            escudoActualConfig1 = escudoActual;
+        }
+        else if (configuracionActiva == 2)
+        {
+            escudoActualConfig2 = escudoActual;
+        }
+        
+        ActualizarBarrasUI();
+    }
+
+    // =====================================================
+    // VISIBILIDAD DE BARRAS
+    // =====================================================
+
+    public void SetBarsVisibleAsTarget(bool visible)
+    {
+        if (isLocalPlayer) return;
+
+        if (healthBarRoot != null)
+            healthBarRoot.gameObject.SetActive(visible);
+
+        if (shieldBarRoot != null)
+            shieldBarRoot.gameObject.SetActive(visible);
+    }
+
+    // =====================================================
+    // REPAIR BOT
+    // =====================================================
+
+    void ActivarRepairBot()
+    {
+        if (repairBotActivo) return;
+        if (repairBotPrefab == null) return;
+
+        repairBotInstance = Instantiate(repairBotPrefab, transform);
+        repairBotActivo = true;
+    }
+
+    void DesactivarRepairBot()
+    {
+        if (!repairBotActivo) return;
+
+        if (repairBotInstance != null)
+        {
+            Destroy(repairBotInstance);
+            repairBotInstance = null;
+        }
+
+        repairBotActivo = false;
+    }
+
+    // =====================================================
+    // SISTEMA DE BOMBAS (sin NetworkIdentity - como Mine.cs)
+    // =====================================================
+
+    [Command]
+    public void CmdSpawnBomba(string bombDataName, Vector3 posicion, uint ownerNetId)
+    {
+        Debug.Log($"[PlayerShip SERVER] Recibida solicitud de bomba: {bombDataName} en {posicion}");
+        
+        // Notificar a TODOS los clientes para que instancien la bomba localmente
+        RpcSpawnBombaEnClientes(bombDataName, posicion, ownerNetId);
+    }
+
+    [ClientRpc]
+    private void RpcSpawnBombaEnClientes(string bombDataName, Vector3 posicion, uint ownerNetId)
+    {
+        Debug.Log($"[PlayerShip] RpcSpawnBombaEnClientes en {(isServer ? "SERVIDOR" : "CLIENTE")} - Bomba: {bombDataName}");
+        
+        // Buscar el ExtraBombData por nombre
+        ExtraBombData bombData = FindBombDataByName(bombDataName);
+        
+        if (bombData == null)
+        {
+            Debug.LogError($"[PlayerShip] No se encontró ExtraBombData con nombre '{bombDataName}'");
+            return;
+        }
+        
+        if (bombData.bombaPrefab == null)
+        {
+            Debug.LogError($"[PlayerShip] bombaPrefab es null para '{bombDataName}'");
+            return;
+        }
+        
+        // Buscar el owner transform
+        Transform ownerTransform = null;
+        if (ownerNetId != 0 && NetworkClient.spawned.TryGetValue(ownerNetId, out NetworkIdentity ownerIdentity))
+        {
+            ownerTransform = ownerIdentity.transform;
+        }
+        
+        // Instanciar la bomba LOCALMENTE (sin NetworkServer.Spawn)
+        GameObject bombaObj = Instantiate(bombData.bombaPrefab, posicion, Quaternion.identity);
+        
+        // Obtener el componente Bomb del prefab (debe tener el script actualizado)
+        Bomb bomba = bombaObj.GetComponent<Bomb>();
+        if (bomba == null)
+        {
+            Debug.LogError("[PlayerShip] El prefab de bomba no tiene componente Bomb!");
+            Destroy(bombaObj);
+            return;
+        }
+        
+        bomba.Init(bombData, ownerTransform, ownerNetId);
+        
+        Debug.Log($"[PlayerShip] ✅ Bomba '{bombData.nombre}' instanciada localmente");
+    }
+
+    private ExtraBombData FindBombDataByName(string bombName)
+    {
+        // Buscar en ExtraUI
+        ExtraUI extraUI = ExtraUI.Instance;
+        if (extraUI != null && extraUI.extras != null)
+        {
+            foreach (var extra in extraUI.extras)
+            {
+                if (extra is ExtraBombData bombData && bombData.name == bombName)
+                {
+                    Debug.Log($"[PlayerShip] ✓ Bomba '{bombName}' encontrada en ExtraUI");
+                    return bombData;
+                }
+            }
+        }
+        
+        // Buscar en Resources
+        ExtraBombData[] allBombs = Resources.LoadAll<ExtraBombData>("");
+        foreach (var bomb in allBombs)
+        {
+            if (bomb.name == bombName)
+            {
+                Debug.Log($"[PlayerShip] ✓ Bomba '{bombName}' encontrada en Resources");
+                return bomb;
+            }
+        }
+        
+        Debug.LogError($"[PlayerShip] ✗ No se encontró bomba con nombre '{bombName}' ni en ExtraUI ni en Resources");
+        return null;
+    }
+
+    // =====================================================
+    // SISTEMA DE ESCUDOS (visible en red - como bombas)
+    // =====================================================
+
+    [Command]
+    public void CmdSpawnEscudo(string escudoDataName, Vector3 posicion, uint ownerNetId)
+    {
+        Debug.Log($"[PlayerShip SERVER] Recibida solicitud de escudo: {escudoDataName} en {posicion}");
+        
+        // Notificar a TODOS los clientes para que instancien el escudo localmente
+        RpcSpawnEscudoEnClientes(escudoDataName, posicion, ownerNetId);
+    }
+
+    [ClientRpc]
+    private void RpcSpawnEscudoEnClientes(string escudoDataName, Vector3 posicion, uint ownerNetId)
+    {
+        Debug.Log($"[PlayerShip] RpcSpawnEscudoEnClientes en {(isServer ? "SERVIDOR" : "CLIENTE")} - Escudo: {escudoDataName}");
+        
+        // Buscar el ExtraEscudoData por nombre
+        ExtraEscudoData escudoData = FindEscudoDataByName(escudoDataName);
+        
+        if (escudoData == null)
+        {
+            Debug.LogError($"[PlayerShip] No se encontró ExtraEscudoData con nombre '{escudoDataName}'");
+            return;
+        }
+        
+        if (escudoData.escudoPrefab == null)
+        {
+            Debug.LogError($"[PlayerShip] escudoPrefab es null para '{escudoDataName}'");
+            return;
+        }
+        
+        // Buscar el owner transform
+        Transform ownerTransform = null;
+        if (ownerNetId != 0 && NetworkClient.spawned.TryGetValue(ownerNetId, out NetworkIdentity ownerIdentity))
+        {
+            ownerTransform = ownerIdentity.transform;
+        }
+        
+        // Instanciar el escudo LOCALMENTE (sin NetworkServer.Spawn)
+        GameObject escudoObj = Instantiate(escudoData.escudoPrefab, posicion, Quaternion.identity);
+        
+        // Si quiere seguir al jugador, parentearlo
+        if (escudoData.seguirAlOwner && ownerTransform != null)
+        {
+            escudoObj.transform.SetParent(ownerTransform, true);
+            escudoObj.transform.localPosition = Vector3.zero;
+        }
+        
+        // Configurar duración
+        Escudo escudo = escudoObj.GetComponent<Escudo>();
+        if (escudo != null)
+        {
+            escudo.SetDuracion(escudoData.duracionSegundos);
+        }
+        
+        Debug.Log($"[PlayerShip] ✅ Escudo '{escudoData.nombre}' instanciado localmente");
+    }
+
+    private ExtraEscudoData FindEscudoDataByName(string escudoName)
+    {
+        // Buscar en ExtraUI
+        ExtraUI extraUI = ExtraUI.Instance;
+        if (extraUI != null && extraUI.extras != null)
+        {
+            foreach (var extra in extraUI.extras)
+            {
+                if (extra is ExtraEscudoData escudoData && escudoData.name == escudoName)
+                {
+                    Debug.Log($"[PlayerShip] ✓ Escudo '{escudoName}' encontrado en ExtraUI");
+                    return escudoData;
+                }
+            }
+        }
+        
+        // Buscar en Resources
+        ExtraEscudoData[] allEscudos = Resources.LoadAll<ExtraEscudoData>("");
+        foreach (var escudo in allEscudos)
+        {
+            if (escudo.name == escudoName)
+            {
+                Debug.Log($"[PlayerShip] ✓ Escudo '{escudoName}' encontrado en Resources");
+                return escudo;
+            }
+        }
+        
+        Debug.LogError($"[PlayerShip] ✗ No se encontró escudo con nombre '{escudoName}' ni en ExtraUI ni en Resources");
+        return null;
+    }
+
+    // =====================================================
+    // SISTEMA DE PEM (visible en red - como bombas y escudos)
+    // =====================================================
+
+    [Command]
+    public void CmdSpawnPem(string pemDataName, Vector3 posicion, uint ownerNetId)
+    {
+        Debug.Log($"[PlayerShip SERVER] Recibida solicitud de PEM: {pemDataName} en {posicion}");
+        
+        // Notificar a TODOS los clientes para que instancien el PEM localmente
+        RpcSpawnPemEnClientes(pemDataName, posicion, ownerNetId);
+    }
+
+    [ClientRpc]
+    private void RpcSpawnPemEnClientes(string pemDataName, Vector3 posicion, uint ownerNetId)
+    {
+        Debug.Log($"[PlayerShip] RpcSpawnPemEnClientes en {(isServer ? "SERVIDOR" : "CLIENTE")} - PEM: {pemDataName}");
+        
+        // Buscar el ExtraPemData por nombre
+        ExtraPemData pemData = FindPemDataByName(pemDataName);
+        
+        if (pemData == null)
+        {
+            Debug.LogError($"[PlayerShip] No se encontró ExtraPemData con nombre '{pemDataName}'");
+            return;
+        }
+        
+        if (pemData.pemPrefab == null)
+        {
+            Debug.LogError($"[PlayerShip] pemPrefab es null para '{pemDataName}'");
+            return;
+        }
+        
+        // Buscar el owner transform
+        Transform ownerTransform = null;
+        if (ownerNetId != 0 && NetworkClient.spawned.TryGetValue(ownerNetId, out NetworkIdentity ownerIdentity))
+        {
+            ownerTransform = ownerIdentity.transform;
+        }
+        
+        // Instanciar el PEM LOCALMENTE (sin NetworkServer.Spawn)
+        GameObject pemObj = Instantiate(pemData.pemPrefab, posicion, Quaternion.identity);
+        
+        // Obtener el componente Pem
+        Pem pem = pemObj.GetComponent<Pem>();
+        
+        // Si quiere seguir al jugador, parentearlo
+        if (pemData.seguirAlOwner && ownerTransform != null)
+        {
+            pemObj.transform.SetParent(ownerTransform, false);
+            pemObj.transform.localPosition = Vector3.zero;
+            
+            // Inicializar el PEM
+            if (pem != null)
+            {
+                pem.Init(ownerTransform, pemData.evitarSerSeleccionadoSegundos, pemData.seguirAlOwner);
+            }
+        }
+        else
+        {
+            // Si no sigue al owner, configurar duración de todas formas
+            if (pem != null)
+            {
+                pem.Init(ownerTransform, pemData.evitarSerSeleccionadoSegundos, false);
+            }
+        }
+        
+        Debug.Log($"[PlayerShip] ✅ PEM '{pemData.nombre}' instanciado localmente");
+    }
+
+    private ExtraPemData FindPemDataByName(string pemName)
+    {
+        // Buscar en ExtraUI
+        ExtraUI extraUI = ExtraUI.Instance;
+        if (extraUI != null && extraUI.extras != null)
+        {
+            foreach (var extra in extraUI.extras)
+            {
+                if (extra is ExtraPemData pemData && pemData.name == pemName)
+                {
+                    Debug.Log($"[PlayerShip] ✓ PEM '{pemName}' encontrado en ExtraUI");
+                    return pemData;
+                }
+            }
+        }
+        
+        // Buscar en Resources
+        ExtraPemData[] allPems = Resources.LoadAll<ExtraPemData>("");
+        foreach (var pem in allPems)
+        {
+            if (pem.name == pemName)
+            {
+                Debug.Log($"[PlayerShip] ✓ PEM '{pemName}' encontrado en Resources");
+                return pem;
+            }
+        }
+        
+        Debug.LogError($"[PlayerShip] ✗ No se encontró PEM con nombre '{pemName}' ni en ExtraUI ni en Resources");
+        return null;
+    }
+
+    // =====================================================
+    // SISTEMA DE INVULNERABILIDAD
+    // =====================================================
+
+    /// <summary>
+    /// Activa invulnerabilidad temporal (llamado cuando se usa escudo)
+    /// </summary>
+    public void ActivarInvulnerabilidad(float duracion)
+    {
+        if (!isServer)
+        {
+            CmdActivarInvulnerabilidad(duracion);
+            return;
+        }
+
+        esInvulnerable = true;
+        tiempoFinInvulnerabilidad = Time.time + duracion;
+        
+        Debug.Log($"[PlayerShip] {name} ahora es INVULNERABLE por {duracion} segundos");
+    }
+
+    [Command]
+    void CmdActivarInvulnerabilidad(float duracion)
+    {
+        ActivarInvulnerabilidad(duracion);
+    }
+
+    // =====================================================
+    // SISTEMA PEM - NO SELECCIONABLE
+    // =====================================================
+
+    /// <summary>
+    /// Activa el estado de no seleccionable (llamado cuando se usa PEM)
+    /// </summary>
+    public void ActivarPEM(float duracion)
+    {
+        if (!isServer)
+        {
+            CmdActivarPEM(duracion);
+            return;
+        }
+
+        esNoSeleccionable = true;
+        tiempoFinNoSeleccionable = Time.time + duracion;
+        
+        // FORZAR A TODOS LOS QUE ME ESTÁN ATACANDO A DESMARCARME
+        DesmarcarmeDeAtacantes();
+        
+        Debug.Log($"[PlayerShip] {name} ahora es NO SELECCIONABLE por {duracion} segundos");
+    }
+
+    [Command]
+    void CmdActivarPEM(float duracion)
+    {
+        ActivarPEM(duracion);
+    }
+
+    /// <summary>
+    /// Hook que se ejecuta cuando cambia el estado de noSeleccionable
+    /// </summary>
+    void OnNoSeleccionableChanged(bool oldValue, bool newValue)
+    {
+        esNoSeleccionable = newValue;
+        
+        if (newValue)
+        {
+            Debug.Log($"[PlayerShip] {name} YA NO puede ser seleccionado");
+        }
+        else
+        {
+            Debug.Log($"[PlayerShip] {name} YA puede ser seleccionado");
+        }
+    }
+
+    /// <summary>
+    /// Getter público para saber si esta nave puede ser seleccionada
+    /// </summary>
+    public bool EsSeleccionable()
+    {
+        return !esNoSeleccionable;
+    }
+
+    /// <summary>
+    /// Fuerza a todos los atacantes a desmarcarse de esta nave
+    /// </summary>
+    private void DesmarcarmeDeAtacantes()
+    {
+        // Buscar TODOS los PlayerShips en la escena
+        PlayerShip[] todosLosJugadores = FindObjectsOfType<PlayerShip>();
+        
+        foreach (PlayerShip otroJugador in todosLosJugadores)
+        {
+            // Si ese jugador me tiene como objetivo, forzarlo a desmarcarme
+            if (otroJugador != this && otroJugador.GetCurrentAttackTarget() == transform)
+            {
+                Debug.Log($"[PlayerShip] Forzando a {otroJugador.name} a desmarcarme (SERVER)");
+                
+                // FORZAR desde el servidor directamente actualizando la SyncVar
+                otroJugador.ForzarDesmarcadoDesdeServidor();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Cambia la nave actual del jugador (solo para jugador local)
+    /// </summary>
+    public void CambiarNave(NaveData nuevaNaveData)
+    {
+        Debug.Log($"[PlayerShip] 🔄 CambiarNave LLAMADO - Nave: {nuevaNaveData?.nombreNave}, isLocalPlayer: {isLocalPlayer}, isServer: {isServer}, netId: {netId}");
+        
+        if (!isLocalPlayer)
+        {
+            Debug.LogWarning("[PlayerShip] Solo el jugador local puede cambiar de nave");
+            return;
+        }
+
+        if (nuevaNaveData == null)
+        {
+            Debug.LogError("[PlayerShip] NaveData es null");
+            return;
+        }
+
+        if (naveRegistry == null)
+        {
+            Debug.LogError("[PlayerShip] NaveRegistry es null");
+            return;
+        }
+
+        // Obtener el índice de la nueva nave
+        int nuevoIndice = naveRegistry.GetIndiceDeNave(nuevaNaveData);
+        if (nuevoIndice < 0)
+        {
+            Debug.LogError($"[PlayerShip] No se encontró la nave '{nuevaNaveData.nombreNave}' en el registro");
+            return;
+        }
+
+        Debug.Log($"[PlayerShip] Cambiando nave a: {nuevaNaveData.nombreNave} (índice {nuevoIndice})");
+
+        // Actualizar el NaveData local
+        naveData = nuevaNaveData;
+
+        // Enviar el nuevo índice al servidor
+        Debug.Log($"[PlayerShip] ⬆️ Enviando CmdCambiarNave({nuevoIndice}) al servidor...");
+        CmdCambiarNave(nuevoIndice);
+
+        // Actualizar el visual localmente
+        Debug.Log($"[PlayerShip] 🎨 Actualizando visual localmente...");
+        ActualizarVisualDeNave(nuevaNaveData);
+
+        // Actualizar stats localmente
+        ActualizarStatsDeNave(nuevaNaveData);
+
+        // 🔧 NOTIFICAR AL EQUIPMENTPANEL PARA QUE ACTUALICE LOS SLOTS
+        if (EquipmentPanel.Instance != null)
+        {
+            EquipmentPanel.Instance.RefrescarPorCambioDeNave();
+            Debug.Log("[PlayerShip] EquipmentPanel notificado del cambio de nave");
+        }
+        
+        // 📋 NOTIFICAR AL MENUUI PARA QUE ACTUALICE LA INFO DE LA NAVE
+        MenuUI menuUI = FindObjectOfType<MenuUI>();
+        if (menuUI != null)
+        {
+            menuUI.RefrescarInfoNave();
+            Debug.Log("[PlayerShip] MenuUI notificado del cambio de nave");
+        }
+        
+        Debug.Log($"[PlayerShip] ✅ CambiarNave COMPLETADO localmente");
+    }
+
+    [Command]
+    void CmdCambiarNave(int nuevoIndice)
+    {
+        Debug.Log($"[PlayerShip SERVER] 📥 CmdCambiarNave recibido: índice {nuevoIndice}, connectionToClient: {connectionToClient.connectionId}, netId: {netId}");
+
+        // Actualizar el índice sincronizado (esto dispara OnNaveIndexChanged en todos los clientes)
+        Debug.Log($"[PlayerShip SERVER] ⚡ Actualizando naveIndex: {naveIndex} → {nuevoIndice} (esto disparará OnNaveIndexChanged en todos)");
+        naveIndex = nuevoIndice;
+
+        // Obtener la nueva NaveData
+        if (naveRegistry != null)
+        {
+            NaveData nuevaData = naveRegistry.GetNavePorIndice(nuevoIndice);
+            if (nuevaData != null)
+            {
+                // Actualizar datos visuales sincronizados
+                visualRotation = nuevaData.rotacionLocal;
+                visualScale = nuevaData.escalaLocal;
+                visualPosition = nuevaData.posicionLocal;
+                visualDataSynced = true;
+
+                // Actualizar stats en el servidor
+                velocidadBase = nuevaData.velocidadBase;
+                int nuevoVidaMax = Mathf.RoundToInt(nuevaData.vidaMax);
+                
+                // Ajustar vida actual proporcionalmente
+                float porcentajeVida = vidaMax > 0 ? (float)vidaActual / vidaMax : 1f;
+                vidaMax = nuevoVidaMax;
+                vidaActual = Mathf.RoundToInt(nuevoVidaMax * porcentajeVida);
+                vidaActual = Mathf.Clamp(vidaActual, 1, vidaMax);
+
+                RecalcularVelocidadTotal();
+                ActualizarBarrasUI();
+
+                Debug.Log($"[PlayerShip SERVER] ✅ Nave cambiada a: {nuevaData.nombreNave}");
+            }
+            else
+            {
+                Debug.LogError($"[PlayerShip SERVER] No se pudo obtener NaveData para índice {nuevoIndice}");
+            }
+        }
+        else
+        {
+            Debug.LogError("[PlayerShip SERVER] naveRegistry es null");
+        }
+    }
+
+    /// <summary>
+    /// Actualiza el visual de la nave (destruye el anterior y crea el nuevo)
+    /// </summary>
+    void ActualizarVisualDeNave(NaveData nuevaData)
+    {
+        Debug.Log($"[PlayerShip] 🔧 ActualizarVisualDeNave INICIANDO - Nave: {nuevaData?.nombreNave}, isLocalPlayer: {isLocalPlayer}, isServer: {isServer}, netId: {netId}");
+        
+        if (nuevaData == null || nuevaData.prefabNave == null)
+        {
+            Debug.LogError("[PlayerShip] No se puede actualizar visual: NaveData o prefab null");
+            return;
+        }
+
+        // 🧹 PRIMERO: Limpiar FirePoints viejos explícitamente
+        if (firePoints != null)
+        {
+            for (int i = 0; i < firePoints.Length; i++)
+            {
+                if (firePoints[i] != null && firePoints[i].gameObject != null)
+                {
+                    Destroy(firePoints[i].gameObject);
+                }
+            }
+            firePoints = null;
+            Debug.Log($"[PlayerShip] FirePoints viejos destruidos (netId: {netId})");
+        }
+
+        // Destruir el visual anterior
+        if (naveVisual != null)
+        {
+            Destroy(naveVisual);
+            naveVisual = null;
+        }
+
+        // Crear el nuevo visual
+        naveVisual = Instantiate(nuevaData.prefabNave, transform);
+        naveVisual.transform.localPosition = nuevaData.posicionLocal;
+        naveVisual.transform.localRotation = Quaternion.Euler(nuevaData.rotacionLocal);
+        naveVisual.transform.localScale = nuevaData.escalaLocal;
+
+        naveVisualInstanciada = true;
+
+        // Recrear los fire points INMEDIATAMENTE en el nuevo visual
+        CrearFirePointsDesdeNaveData(nuevaData);
+        
+        Debug.Log($"[PlayerShip] FirePoints creados: {(firePoints != null ? firePoints.Length : 0)} (netId: {netId})");
+
+        // 🔫 NOTIFICAR INMEDIATAMENTE (sin delay)
+        if (firePoints != null && firePoints.Length > 0)
+        {
+            // Verificar que los FirePoints sean válidos AHORA
+            int validCount = 0;
+            for (int i = 0; i < firePoints.Length; i++)
+            {
+                if (firePoints[i] != null)
+                {
+                    validCount++;
+                    Debug.Log($"[PlayerShip] ✓ FirePoint[{i}] creado: {firePoints[i].name} en posición {firePoints[i].position} (netId: {netId})");
+                }
+                else
+                {
+                    Debug.LogError($"[PlayerShip] ✗ FirePoint[{i}] es NULL al crear! (netId: {netId})");
+                }
+            }
+            
+            if (validCount > 0)
+            {
+                PlayerShoot playerShoot = GetComponent<PlayerShoot>();
+                if (playerShoot != null)
+                {
+                    playerShoot.ActualizarFirePoints(firePoints);
+                    Debug.Log($"[PlayerShip] ✅ PlayerShoot notificado INMEDIATAMENTE de {validCount} FirePoints válidos (netId: {netId})");
+                }
+                else
+                {
+                    Debug.LogError($"[PlayerShip] No se encontró PlayerShoot component! (netId: {netId})");
+                }
+            }
+            else
+            {
+                Debug.LogError($"[PlayerShip] Todos los FirePoints son NULL después de crear! (netId: {netId})");
+            }
+        }
+        else
+        {
+            Debug.LogError($"[PlayerShip] No se crearon FirePoints! (netId: {netId})");
+        }
+
+        Debug.Log($"[PlayerShip] ✅ Visual actualizado a: {nuevaData.nombreNave} (netId: {netId})");
+    }
+
+    /// <summary>
+    /// Actualiza las estadísticas de la nave
+    /// </summary>
+    void ActualizarStatsDeNave(NaveData nuevaData)
+    {
+        if (nuevaData == null) return;
+
+        // Actualizar velocidad
+        velocidadBase = nuevaData.velocidadBase;
+        RecalcularVelocidadTotal();
+
+        // 🆕 OPCIÓN 1: Dar vida completa al cambiar de nave (gameplay justo)
+        vidaMax = Mathf.RoundToInt(nuevaData.vidaMax);
+        vidaActual = vidaMax; // ✅ Vida completa
+        
+        // 🆕 OPCIÓN 2 (alternativa comentada): Mantener % de vida
+        // Descomentar si prefieres mantener el porcentaje de vida:
+        /*
+        int nuevoVidaMax = Mathf.RoundToInt(nuevaData.vidaMax);
+        float porcentajeVida = vidaMax > 0 ? (float)vidaActual / vidaMax : 1f;
+        vidaMax = nuevoVidaMax;
+        vidaActual = Mathf.RoundToInt(nuevoVidaMax * porcentajeVida);
+        vidaActual = Mathf.Clamp(vidaActual, 1, vidaMax);
+        */
+
+        // Actualizar UI
+        ActualizarBarrasUI();
+
+        Debug.Log($"[PlayerShip] Stats actualizados - Vida: {vidaActual}/{vidaMax}, Velocidad: {velocidadActual}");
+    }
+
+    /// <summary>
+    /// Fuerza el desmarcado desde el servidor (solo llamar en servidor)
+    /// </summary>
+    private void ForzarDesmarcadoDesdeServidor()
+    {
+        if (!isServer)
+        {
+            Debug.LogWarning("[PlayerShip] ForzarDesmarcadoDesdeServidor debe llamarse solo en servidor");
+            return;
+        }
+
+        // Actualizar directamente la SyncVar desde el servidor
+        currentTargetNetId = 0;
+        
+        // 🔫 DETENER EL DISPARO EN TODOS LOS CLIENTES
+        RpcForzarDetenerDisparo();
+        
+        Debug.Log($"[PlayerShip] {name} fue desmarcado por PEM y disparo detenido");
+    }
+    
+    [ClientRpc]
+    void RpcForzarDetenerDisparo()
+    {
+        // Ejecutar en todos los clientes (especialmente en el que está disparando)
+        PlayerShoot playerShoot = GetComponent<PlayerShoot>();
+        if (playerShoot != null)
+        {
+            // Llamar directamente al método privado con parámetro
+            playerShoot.DetenerDisparoYLimpiarObjetivo();
+            
+            Debug.Log($"[PlayerShip] Disparo detenido por PEM en cliente de {name}");
+        }
+    }
+}
