@@ -1,0 +1,288 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+using Mirror;
+
+public class TargetSelector : MonoBehaviour
+{
+    [Header("Referencia de cámara")]
+    public Camera mainCamera;
+
+    [Header("Marcador de selección")]
+    public Sprite markerSprite;
+    public Vector3 markerOffset = new Vector3(0f, 2f, 0f);
+    public Vector3 markerScale = new Vector3(20f, 20f, 20f);
+    public Vector3 markerEulerRotation = new Vector3(90f, 0f, 0f);
+
+    [Header("Rotación del marcador")]
+    public bool rotateMarker = true;
+    public float rotationSpeed = 80f;
+    public Vector3 rotationAxisLocal = Vector3.forward;
+
+    [Header("Tags seleccionables")]
+    public string[] tagsSeleccionables = { "Alien", "Player" };
+
+    private Transform objetivoActual;
+    private GameObject markerActual;
+    private Vector3 worldRotationAxis = Vector3.up;
+    private PlayerShip lastSelectedShip;
+    private Alien lastSelectedAlien;
+
+    void Awake()
+    {
+        if (mainCamera == null)
+            mainCamera = Camera.main;
+    }
+
+    void Update()
+    {
+        if (mainCamera == null) return;
+
+        // ✅ Unity sobrecarga el operador == para detectar objetos destruidos
+        // Cuando un objeto se destruye, Unity hace que "obj == null" sea true
+        if (objetivoActual == null)
+        {
+            // Si hay un marcador activo pero no hay objetivo, limpiarlo
+            if (markerActual != null)
+            {
+                Debug.Log("[TargetSelector] Objetivo null, limpiando marcador");
+                Deseleccionar();
+                return;
+            }
+        }
+
+        Vector2 pointerPos;
+        bool pressed = false;
+
+        if (Touchscreen.current != null && Touchscreen.current.primaryTouch.press.wasPressedThisFrame)
+        {
+            pressed = true;
+            pointerPos = Touchscreen.current.primaryTouch.position.ReadValue();
+        }
+        else if (Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame)
+        {
+            pressed = true;
+            pointerPos = Mouse.current.position.ReadValue();
+        }
+        else
+        {
+            // Solo rotar el marcador aquí, la posición se actualiza en LateUpdate
+            if (markerActual != null && rotateMarker)
+            {
+                markerActual.transform.Rotate(worldRotationAxis, rotationSpeed * Time.deltaTime, Space.World);
+            }
+            return;
+        }
+
+        IntentarSeleccionar(pointerPos);
+    }
+
+    /// <summary>
+    /// LateUpdate se ejecuta DESPUÉS de todos los Updates, garantizando que el marcador
+    /// siempre siga al objetivo con la posición más actualizada
+    /// </summary>
+    void LateUpdate()
+    {
+        // Si el objetivo fue destruido, limpiar
+        if (objetivoActual == null)
+        {
+            if (markerActual != null)
+            {
+                Debug.Log("[TargetSelector] Objetivo destruido en LateUpdate, limpiando");
+                Deseleccionar();
+            }
+            return;
+        }
+
+        // ✅ Actualizar la posición del marcador SIEMPRE en LateUpdate
+        if (markerActual != null)
+        {
+            markerActual.transform.position = objetivoActual.position + markerOffset;
+        }
+    }
+
+    bool EsTagSeleccionable(string tag)
+    {
+        for (int i = 0; i < tagsSeleccionables.Length; i++)
+        {
+            if (tag == tagsSeleccionables[i])
+                return true;
+        }
+        return false;
+    }
+
+    bool EsMiPropiaNave(Transform t)
+    {
+        PlayerShip ship = t.GetComponentInParent<PlayerShip>();
+        if (ship == null)
+            return false;
+
+        if (ship.isLocalPlayer)
+            return true;
+
+        return false;
+    }
+
+    void Seleccionar(Transform nuevoObjetivo)
+    {
+        if (lastSelectedShip != null)
+        {
+            lastSelectedShip.SetBarsVisibleAsTarget(false);
+            lastSelectedShip = null;
+        }
+
+        if (lastSelectedAlien != null)
+        {
+            lastSelectedAlien.SetBarsVisibleForLocal(false);
+            lastSelectedAlien = null;
+        }
+
+        objetivoActual = nuevoObjetivo;
+
+        PlayerShip nuevaShip = objetivoActual != null ? objetivoActual.GetComponentInParent<PlayerShip>() : null;
+        if (nuevaShip != null && !nuevaShip.isLocalPlayer)
+        {
+            nuevaShip.SetBarsVisibleAsTarget(true);
+            lastSelectedShip = nuevaShip;
+        }
+
+        Alien nuevoAlien = objetivoActual != null ? objetivoActual.GetComponentInParent<Alien>() : null;
+        if (nuevoAlien != null)
+        {
+            nuevoAlien.SetBarsVisibleForLocal(true);
+            lastSelectedAlien = nuevoAlien;
+        }
+
+        if (markerActual == null && markerSprite != null)
+        {
+            markerActual = new GameObject("TargetMarker");
+            var sr = markerActual.AddComponent<SpriteRenderer>();
+            sr.sprite = markerSprite;
+            sr.sortingOrder = 100;
+
+            markerActual.transform.localScale = markerScale;
+            markerActual.transform.rotation = Quaternion.Euler(markerEulerRotation);
+            worldRotationAxis = markerActual.transform.rotation * rotationAxisLocal.normalized;
+        }
+
+        if (markerActual != null && objetivoActual != null)
+        {
+            markerActual.transform.position = objetivoActual.position + markerOffset;
+        }
+    }
+
+    public void Deseleccionar()
+    {
+        objetivoActual = null;
+
+        if (lastSelectedShip != null)
+        {
+            lastSelectedShip.SetBarsVisibleAsTarget(false);
+            lastSelectedShip = null;
+        }
+
+        if (lastSelectedAlien != null)
+        {
+            lastSelectedAlien.SetBarsVisibleForLocal(false);
+            lastSelectedAlien = null;
+        }
+
+        if (markerActual != null)
+        {
+            Destroy(markerActual);
+            markerActual = null;
+        }
+    }
+
+    public Transform GetObjetivoActual()
+    {
+        return objetivoActual;
+    }
+
+    /// <summary>
+    /// Limpia la selección si el objetivo que murió era el seleccionado actualmente
+    /// </summary>
+    public void ClearSelectionFor(Transform target)
+    {
+        Debug.Log($"[TargetSelector] ClearSelectionFor llamado para {(target != null ? target.name : "null")}");
+        Debug.Log($"[TargetSelector] objetivoActual = {(objetivoActual != null ? objetivoActual.name : "null")}");
+        Debug.Log($"[TargetSelector] Son iguales? {objetivoActual == target}");
+        
+        if (target == null)
+        {
+            Debug.Log("[TargetSelector] Target es null, saliendo");
+            return;
+        }
+        
+        // Si el objetivo que murió es el actual, deseleccionar
+        if (objetivoActual == target)
+        {
+            Debug.Log($"[TargetSelector] ✅ Limpiando selección porque {target.name} fue destruido");
+            Deseleccionar();
+        }
+        else
+        {
+            Debug.Log($"[TargetSelector] ❌ No se limpia porque el target no coincide con objetivoActual");
+        }
+    }
+
+    void IntentarSeleccionar(Vector2 screenPosition)
+    {
+        if (mainCamera == null) return;
+
+        Ray ray = mainCamera.ScreenPointToRay(screenPosition);
+
+        if (Physics.Raycast(ray, out RaycastHit hit, 1000f))
+        {
+            // Buscar un transform con tag seleccionable subiendo por los padres
+            Transform t = hit.collider.transform;
+            Transform seleccionado = null;
+
+            while (t != null)
+            {
+                if (EsTagSeleccionable(t.tag))
+                {
+                    seleccionado = t;
+                    break;
+                }
+                t = t.parent;
+            }
+
+            if (seleccionado != null)
+            {
+                // ✅ CRÍTICO: Buscar el componente real en padres y usar ESE transform
+                PlayerShip shipComponent = seleccionado.GetComponentInParent<PlayerShip>();
+                Alien alienComponent = seleccionado.GetComponentInParent<Alien>();
+                
+                if (shipComponent != null)
+                {
+                    seleccionado = shipComponent.transform;
+                    Debug.Log($"[TargetSelector] PlayerShip encontrado: {seleccionado.name}");
+                    
+                    // 📡 VERIFICAR SI LA NAVE ES SELECCIONABLE (PEM)
+                    if (!shipComponent.EsSeleccionable())
+                    {
+                        Debug.Log($"[TargetSelector] ⚠️ No puedes seleccionar '{seleccionado.name}' (PEM activo)");
+                        // Opcional: Reproducir sonido de error o mostrar feedback visual
+                        return;
+                    }
+                }
+                else if (alienComponent != null)
+                {
+                    seleccionado = alienComponent.transform;
+                    Debug.Log($"[TargetSelector] Alien encontrado: {seleccionado.name}");
+                }
+                else
+                {
+                    Debug.LogWarning($"[TargetSelector] '{seleccionado.name}' tiene tag pero no componente PlayerShip/Alien");
+                    return;
+                }
+                
+                // No permitir seleccionar mi propia nave (el Player local)
+                if (!EsMiPropiaNave(seleccionado))
+                {
+                    Seleccionar(seleccionado);
+                }
+            }
+        }
+    }
+}
